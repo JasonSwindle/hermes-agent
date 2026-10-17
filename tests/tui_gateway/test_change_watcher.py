@@ -482,3 +482,23 @@ def test_broken_probe_never_kills_the_pass(watcher_home, monkeypatch):
 
     # The broken cron probe is skipped; sessions still broadcasts.
     assert ("sessions.changed", {}) in events
+
+
+def test_skill_installed_from_another_terminal_broadcasts_skills_changed(watcher_home, monkeypatch):
+    """CFG-8: the gateway notices a new skill dir and tells attached clients to refetch
+    ``commands.catalog``; clients never rescan disk themselves."""
+    home, events = watcher_home
+    import tools.skills_tool as st
+    skills = home / "skills"
+    skills.mkdir()
+    monkeypatch.setattr(st, "SKILLS_DIR", skills)
+    server._broadcast_watched_changes(now=0.0)
+    assert not [e for e in events if e[0] == "skills.changed"]
+
+    skill = skills / "new-skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: new-skill\ndescription: d\n---\nbody\n")
+    os.utime(skills, (time.time() + 5, time.time() + 5))
+    server._broadcast_watched_changes(now=10.0)
+
+    assert ("skills.changed", {}) in events

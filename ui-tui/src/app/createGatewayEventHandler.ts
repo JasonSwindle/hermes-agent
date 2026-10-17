@@ -1116,6 +1116,13 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         return
 
+      // A skill installed or removed from another terminal: refetch the palette from the gateway
+      // (it rescans; this client never reads the skills dir itself).
+      case 'skills.changed':
+        void loadSlashCatalog(rpc, getUiState().sid, setCatalog)
+
+        return
+
       case 'free_tier.challenge':
         showChallenge(ev.payload)
 

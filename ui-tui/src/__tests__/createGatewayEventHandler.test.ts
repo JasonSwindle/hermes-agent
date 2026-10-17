@@ -1070,6 +1070,21 @@ describe('createGatewayEventHandler', () => {
     vi.unstubAllEnvs()
   })
 
+  it('skills.changed refetches the slash catalog from the gateway for the live session (CFG-8)', async () => {
+    const ctx = buildCtx([])
+
+    const rpc = vi.fn(async () => ({ canon: { '/new-skill': '/new-skill' }, pairs: [['/new-skill', 'd']], skill_count: 1 }))
+
+    ;(ctx.gateway as any).rpc = rpc
+    patchUiState({ sid: 'sid-cfg8' })
+
+    createGatewayEventHandler(ctx)({ payload: {}, type: 'skills.changed' } as any)
+    await vi.waitFor(() => expect(ctx.session.setCatalog).toHaveBeenCalled())
+
+    expect(rpc).toHaveBeenCalledWith('commands.catalog', { session_id: 'sid-cfg8' })
+    expect((ctx.session.setCatalog as any).mock.calls.at(-1)[0].canon).toEqual({ '/new-skill': '/new-skill' })
+  })
+
   it('a skin that owns the background paints BOTH terminal defaults (OSC 11 bg + OSC 10 fg)', () => {
     // Default-fg tokens (markdown body, borders) render with the TERMINAL's
     // default foreground. A dark skin on a light terminal repaints the

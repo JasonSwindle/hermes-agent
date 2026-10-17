@@ -48418,6 +48418,18 @@
       ]
     },
     {
+      "name": "skills.changed",
+      "summary": "A skill root moved (installed/removed elsewhere); refetch commands.catalog from the gateway.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/ChangeSignalPayload"
+          }
+        }
+      ]
+    },
+    {
       "name": "skin.changed",
       "summary": "The active skin moved (name switch or live colour edit); repaint from this palette.",
       "params": [

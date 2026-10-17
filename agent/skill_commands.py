@@ -29,6 +29,10 @@ _skill_commands_by_key: dict[tuple, dict[str, dict[str, Any]]] = {}
 # Keep the last map callers could actually see, even when plugin lifecycle
 # invalidation drops the projection cache before /reload-skills can diff it.
 _last_interactive_skill_commands_by_key: dict[tuple, dict[str, dict[str, Any]]] = {}
+# The on-disk signature each published map was scanned at (same key). The one gateway serves every
+# local session for its whole lifetime, so a skill installed or removed from another terminal must
+# move this signature and rescan on the next lookup instead of waiting for /reload-skills (CFG-8).
+_skill_commands_sig_by_key: dict[tuple, tuple] = {}
 _publish_lock = threading.Lock()
 # ``\w`` keeps Unicode letters (CJK, Cyrillic) so a ``name: 小说拆条`` skill registers ``/小说拆条``
 # instead of slugging to "" and being dropped (#12351); Telegram's ``[a-z0-9_]`` menu limit is
@@ -524,6 +528,8 @@ def scan_skill_commands() -> dict[str, dict[str, Any]]:
     # its own (empty) ``seen_names`` but collided against the first scan's already- published slugs, logging
     # one bogus "already claimed" warning per skill — each naming the same skill as its own incumbent
     # (#74574).
+    # Taken BEFORE the scan: an install racing the scan moves it, so the next lookup rescans.
+    signature = _skill_dirs_signature()
     commands: dict[str, dict[str, Any]] = {}
     try:
         from tools.skills_tool import _get_disabled_skill_names, _skill_catalog
@@ -548,7 +554,21 @@ def scan_skill_commands() -> dict[str, dict[str, Any]]:
         # reader between the lookup and this store (#14536, #74574); the scan above
         # (file I/O, deferred imports) stays outside it.
         _skill_commands_by_key[key] = commands
+        _skill_commands_sig_by_key[key] = signature
     return commands
+
+
+def _skill_dirs_signature() -> Optional[tuple]:
+    """Stat-cheap change signature of every skill root (the catalog's own: each root's mtime and its
+    immediate child dirs', the disabled set and the platform). None when it cannot be computed, which
+    keeps the published map rather than rescanning on every lookup."""
+    try:
+        from tools.skills_tool import _get_disabled_skill_names, _skill_search_dirs, _skills_scan_signature
+        roots, _active = _skill_search_dirs()
+        return _skills_scan_signature([d for _tier, d in roots], _get_disabled_skill_names())
+    except Exception:
+        logger.debug("Skill dir signature failed", exc_info=True)
+        return None
 
 
 def get_skill_commands() -> dict[str, dict[str, Any]]:
@@ -566,8 +586,13 @@ def get_skill_commands() -> dict[str, dict[str, Any]]:
     key = (_resolve_skill_commands_platform(), _resolve_skill_commands_home(), _resolve_skill_commands_project())
     with _publish_lock:
         cached = _skill_commands_by_key.get(key)
+        scanned_at = _skill_commands_sig_by_key.get(key)
     if cached is not None:
-        return cached
+        # A skill installed or removed from another terminal moves the dir signature: rescan, so the
+        # long-lived gateway's palette and dispatch see it without /reload-skills (CFG-8).
+        current = _skill_dirs_signature()
+        if current is None or scanned_at is None or current == scanned_at:
+            return cached
     # Scan outside the lock — file I/O and deferred imports; concurrent scans
     # are safe since each builds its own map.
     return scan_skill_commands()

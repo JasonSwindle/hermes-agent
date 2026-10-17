@@ -361,6 +361,14 @@ def _bot_relay_outbox_sig():
     return _bot_relay_outbox_seen or None
 
 
+def _skills_sig():
+    """The skill roots' stat signature (``agent.skill_commands._skill_dirs_signature``): a skill
+    installed or removed from another terminal (``hermes skills install``, a dropped SKILL.md) moves it,
+    and attached clients refetch ``commands.catalog`` from this gateway instead of rescanning disk."""
+    from agent.skill_commands import _skill_dirs_signature
+    return _skill_dirs_signature()
+
+
 # event → (check interval, signature fn, payload fn). Signatures are stat-cheap; the interval
 # keeps pricier probes (pet resolves the sheet off disk) off the 0.5s tick. cron/jobs.json
 # moves on edits AND scheduler ticks; gateway_state.json is where the messaging gateway
@@ -375,6 +383,7 @@ _CHANGE_WATCHES: dict[str, tuple[float, Any, Any]] = {
     "platforms.changed": (2.0, lambda: _home_mtime_ns("gateway_state.json"), dict),
     "projects.changed": (2.0, _projects_sig, dict),
     "pairing.changed": (2.0, _pairing_sig, dict),
+    "skills.changed": (2.0, _skills_sig, dict),
     # 1s so a queued DM envelope reaches the Desktop's push-triggered drain fast.
     "bot_relay.outbox.pending": (1.0, _bot_relay_outbox_sig, dict)}
 
