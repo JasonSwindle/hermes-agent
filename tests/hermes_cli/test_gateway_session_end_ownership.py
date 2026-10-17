@@ -89,3 +89,41 @@ def test_interrupted_one_shot_leaves_on_session_end_to_the_gateway_turn(mock_inv
     one_shot = SimpleNamespace(agent=_gateway_agent("gw-session"), session_id="gw-session")
     cli_mod._emit_interrupted_session_end(one_shot)
     assert not [c for c in mock_invoke_hook.call_args_list if c.args == ("on_session_end",)]
+
+
+def _ctrl_d(cli):
+    buf = SimpleNamespace(text="")
+    event = SimpleNamespace(app=SimpleNamespace(current_buffer=buf, exit=MagicMock()))
+    cli._tui_handle_ctrl_d(event)
+    event.app.exit.assert_called_once()
+
+
+def _shutdown_mid_turn(cli_mod, cli):
+    cli._session_db = MagicMock()
+    with patch.object(cli_mod, "_run_cleanup"), patch.object(cli, "_print_exit_summary"), \
+            patch.object(cli, "_release_active_session"):
+        cli._tui_shutdown()
+
+
+@patch("hermes_cli.lifecycle.invoke_hook")
+def test_ctrl_d_mid_turn_detaches_without_interrupting_the_gateway_turn(_hook, cli_mod):
+    """#134889 LC-6b: EOF while a gateway turn runs leaves it running; the detach closes the row later."""
+    cli = cli_mod.HermesCLI()
+    cli.agent = _gateway_agent("gw-session")
+    cli._agent_running = True
+    cli._attached_images = []
+    _ctrl_d(cli)
+    _shutdown_mid_turn(cli_mod, cli)
+    calls = [c.args[0] for c in cli.agent.connection.call.call_args_list]
+    assert "session.interrupt" not in calls
+    cli._session_db.end_session.assert_called_once_with("gw-session", "cli_close")
+
+
+@patch("hermes_cli.lifecycle.invoke_hook")
+def test_ctrl_c_force_exit_mid_turn_still_interrupts_the_gateway_turn(_hook, cli_mod):
+    cli = cli_mod.HermesCLI()
+    cli.agent = _gateway_agent("gw-session")
+    cli._agent_running = True
+    _shutdown_mid_turn(cli_mod, cli)
+    calls = [c.args[0] for c in cli.agent.connection.call.call_args_list]
+    assert "session.interrupt" in calls
