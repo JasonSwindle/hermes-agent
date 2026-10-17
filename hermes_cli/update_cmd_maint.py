@@ -43,10 +43,17 @@ def _repair_windows_home_acl() -> None:
     from hermes_constants import get_hermes_home
 
     home = get_hermes_home()
-    granted, _skipped, failed = grant_tree_user_access(home)
+    # The home itself is the operator's choice and may be a link: pin its real directory and walk
+    # below it (links beneath are still never followed).
+    granted, skipped, failed = grant_tree_user_access(home, pin_root=True)
     if failed and not granted:
         path, reason = failed[0]
         raise RuntimeError(f"could not restore user access to {home}: {path}: {reason}")
+    if not granted:
+        # Nothing took (the root itself was skipped or unreadable): the step stays owed, never a
+        # silent success that leaves stranded state stranded.
+        why = f"{skipped[0]} is a junction, symlink or hard link" if skipped else "nothing was walkable"
+        raise RuntimeError(f"could not restore user access to {home}: nothing was repaired ({why})")
     if failed:
         # Like icacls /C: keep going, report the first few; the step stays owed only when nothing took.
         logger.warning("Restoring user access under %s failed for %d entr%s, e.g. %s: %s", home, len(failed),

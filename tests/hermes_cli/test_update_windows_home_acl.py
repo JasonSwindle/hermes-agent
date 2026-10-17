@@ -63,3 +63,28 @@ def test_repair_stays_owed_when_nothing_could_be_granted(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_dir_acl, "_grant_with_pywin32", denied)
     with pytest.raises(RuntimeError, match="could not restore user access"):
         maint._repair_windows_home_acl()
+
+
+def test_repair_walks_below_an_operator_linked_home(monkeypatch, tmp_path):
+    """Review-9 (d): with HERMES_HOME itself a link the tree repair returned (0, [home], []) and the
+    update step reported success having repaired nothing. The home is pinned to its real dir; a link
+    beneath it is still refused."""
+    real = tmp_path / "real-home"
+    (real / "state").mkdir(parents=True)
+    (real / "state" / "s.json").write_text("{}")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (real / "jn").symlink_to(outside, target_is_directory=True)
+    granted, _runs = _fake_elevated_windows(monkeypatch, tmp_path)
+    (tmp_path / "home").symlink_to(real, target_is_directory=True)
+    maint._repair_windows_home_acl()
+    assert sorted(granted) == sorted([str(real), str(real / "state"), str(real / "state" / "s.json")])
+
+
+def test_repair_that_repaired_nothing_stays_owed(monkeypatch, tmp_path):
+    import pytest
+
+    _fake_elevated_windows(monkeypatch, tmp_path)
+    (tmp_path / "home").symlink_to(tmp_path / "gone", target_is_directory=True)  # dangling
+    with pytest.raises(RuntimeError, match="nothing was repaired"):
+        maint._repair_windows_home_acl()

@@ -285,16 +285,20 @@ def iter_tree_without_reparse_points(root: str | Path, skipped: list[Path]) -> I
                 yield child, False
 
 
-def grant_tree_user_access(root: str | Path) -> tuple[int, list[Path], list[tuple[Path, str]]]:
+def grant_tree_user_access(root: str | Path, *, pin_root: bool = False) -> tuple[int, list[Path], list[tuple[Path, str]]]:
     """Recursive :func:`grant_user_access` (the elevated post-update repair): grant the token's user
     full control on *root* and every directory and file under it, inheriting on directories.
+
+    With *pin_root*, *root* is the operator's own choice (``HERMES_HOME``) and may itself be a link:
+    it is resolved once and the walk runs below the real directory. A link BELOW it is still never
+    entered or granted through.
 
     Returns ``(granted, skipped, failed)``: *skipped* are the reparse points (and hard-linked files)
     that were neither granted nor entered, *failed* the ``(path, reason)`` grants that raised. A
     no-op ``(0, [], [])`` off Windows or when not elevated."""
     if sys.platform != "win32" or not process_is_elevated():
         return 0, [], []
-    root = Path(os.path.abspath(root))
+    root = Path(os.path.realpath(root) if pin_root else os.path.abspath(root))
     real_root = os.path.realpath(root)
     granted, skipped, failed = 0, [], []
     for path, is_dir in iter_tree_without_reparse_points(root, skipped):
