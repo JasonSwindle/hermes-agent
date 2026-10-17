@@ -158,6 +158,11 @@ def _whoami_sid() -> str:
 
 
 def _grant_with_icacls(path: Path, is_dir: bool, expected: str | None = None) -> None:
+    if expected is None:
+        # icacls opens by name, so nothing pins the object between the checks and the write. Inside
+        # the home the components were lstat-checked against a known root; with no expected root
+        # (off-home, or a path whose home provenance was lost) there is nothing to check: refuse.
+        raise ReparsePointRefused(f"{path} has no trusted root to check (icacls fallback, no pywin32)")
     if is_dir:
         # icacls applies an inheritable ACE through SetNamedSecurityInfo, which also propagates it
         # down the existing subtree; refuse when that subtree holds a link it could descend into.
