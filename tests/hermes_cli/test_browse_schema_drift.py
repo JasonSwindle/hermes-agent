@@ -258,3 +258,52 @@ def test_startup_eager_reconcile_heals_only_an_unowned_stale_store(own_store_cli
 
     web_server_lifecycle._eager_reconcile_own_session_db()
     assert "last_read_at" in _session_columns(path)
+
+
+# ── Independent review round 1 ──
+
+
+def _lagging_store_with_history(home, rows=400):
+    """A real store with enough history for a multi-page ``messages`` b-tree, one column dropped."""
+    path = home / "state.db"
+    with SessionDB(db_path=path) as db:
+        db.create_session("kept", source="cli")
+        for i in range(rows):
+            db.append_message("kept", role="user", content=f"history {i} " * 40)
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("DROP INDEX IF EXISTS idx_sessions_effective_activity")
+        conn.execute("ALTER TABLE sessions DROP COLUMN last_read_at")
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return path
+
+
+def _file_state(path):
+    """Main file plus WAL content (an empty sidecar a reader creates is not a write)."""
+    wal = path.with_name(path.name + "-wal")
+    return path.read_bytes(), wal.read_bytes() if wal.exists() else b""
+
+
+def test_corrupt_non_root_page_plus_drift_is_not_written(tmp_path):
+    """P1-1: the drift probe fails before any damaged page is read, so only an integrity check
+    under the lock keeps browse from running ALTER TABLE on a corrupt file."""
+    path = _lagging_store_with_history(_profile_home(tmp_path))
+    with closing(sqlite3.connect(path)) as conn:
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name='messages'").fetchone()[0]
+        pages = conn.execute("PRAGMA page_count").fetchone()[0]
+    victim = max(root + 5, pages // 2)  # a messages leaf, never page 1 / sqlite_master
+    with open(path, "r+b") as fh:
+        fh.seek((victim - 1) * page_size + 8)
+        fh.write(b"\xde\xad\xbe\xef" * ((page_size - 16) // 4))
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as conn:
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] != "ok"
+    before = _file_state(path)
+
+    with pytest.raises(HTTPException) as caught:
+        _open_session_db_at_path(path, read_only=True).close()
+    assert caught.value.status_code == 503
+    assert caught.value.detail["error"] == "state_db_corrupt"
+    assert _file_state(path) == before
+    assert "last_read_at" not in _session_columns(path)

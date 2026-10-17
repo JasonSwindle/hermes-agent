@@ -157,12 +157,36 @@ def _apply_additive_schema(path: Path) -> None:
             raise
 
 
+class CorruptStoreError(sqlite3.DatabaseError):
+    """The lagging store is also damaged: browsing must not write DDL into it. Worded like sqlite's
+    own malformed-image error so every caller maps it to the corrupt-store status (``hermes doctor``)."""
+
+    def __init__(self, detail: str):
+        super().__init__(f'database disk image is malformed (quick_check: {detail})')
+
+
+def _quick_check_problem(path: Path):
+    """``PRAGMA quick_check`` on a read-only connection: None when ``ok``, else the first problems."""
+    from hermes_cli.sqlite_safe_read import connect_tracked
+    try:
+        with closing(connect_tracked(path.resolve().as_uri() + '?mode=ro', uri=True, tracking_path=path)) as conn:
+            rows = conn.execute('PRAGMA quick_check').fetchall()
+    except sqlite3.DatabaseError as exc:
+        from hermes_state_errors import is_malformed_db_error
+        if is_malformed_db_error(exc):
+            return str(exc)
+        raise
+    problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != 'ok']
+    return '; '.join(problems[:3]) or None
+
+
 def reconcile_drift_for_browse(path: Path) -> bool:
     """Catch a lagging store up for a read-only browse; True when DDL ran, False when already current.
 
     Raises :class:`DeclarativeDriftError` (``owned=True`` when a running gateway owns the store)
-    with a user-facing detail naming the drift and the remedy. Never touches a store missing its
-    history tables: recreating them empty would hide lost sessions."""
+    with a user-facing detail naming the drift and the remedy, and :class:`CorruptStoreError`
+    when the lagging store is also damaged. Never touches a store missing its history tables:
+    recreating them empty would hide lost sessions."""
     from gateway.runtime_ownership import OwnershipConflict, exclusive_maintenance
 
     reason = schema_drift_reason(path)
@@ -183,6 +207,10 @@ def reconcile_drift_for_browse(path: Path) -> bool:
             # (or a sibling browse) may already have caught the store up.
             if schema_drift_reason(path) is None:
                 return False
+            # A failing column probe hides damage elsewhere in the file: additive DDL is not
+            # corruption recovery, so never write into a store that is not clean.
+            if problem := _quick_check_problem(path):
+                raise CorruptStoreError(problem)
             _apply_additive_schema(path)
     except OwnershipConflict as exc:
         raise DeclarativeDriftError(
