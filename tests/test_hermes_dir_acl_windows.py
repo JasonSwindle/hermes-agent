@@ -3,8 +3,10 @@
 The reporters' dirs were created by an elevated process: a DACL of SYSTEM + Administrators only, no
 entry for the user. Their own non-elevated token holds Administrators as deny-only, so it gets
 ``WinError 5`` inside. Each probe runs in a child that builds that filtered token itself
-(``CreateRestrictedToken``: Administrators deny-only, every privilege but SeChangeNotify removed, so
-no SeBackup/SeRestore bypass), impersonates it, and then touches the dir the way production does.
+(``CreateRestrictedToken``: Administrators deny-only, every privilege but SeChangeNotify removed, after
+SeBackup/SeRestore are removed from the process token outright), impersonates it, and then touches the
+dir the way production does. Each test first proves that child is refused where the reporters were
+and skips with the runner's identity when it is not (the arm64 hosted runner once let it in).
 
 The parent needs an elevated token (the hosted runner has one) to stand in for the elevated
 install; ``make_user_dir`` only grants when the creating process is elevated.
@@ -20,48 +22,6 @@ import pytest
 pytestmark = pytest.mark.platforms("windows")
 
 _REPO = Path(__file__).resolve().parent.parent
-
-_FILTERED_TOKEN = textwrap.dedent(r"""
-    import ctypes, ctypes.wintypes as w, json, os, sys
-    from pathlib import Path
-
-    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-
-    class SID_AND_ATTRIBUTES(ctypes.Structure):
-        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", w.DWORD)]
-
-    kernel.GetCurrentProcess.restype = w.HANDLE
-    advapi.OpenProcessToken.argtypes = [w.HANDLE, w.DWORD, ctypes.POINTER(w.HANDLE)]
-    advapi.ConvertStringSidToSidW.argtypes = [w.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
-    advapi.CreateRestrictedToken.argtypes = [w.HANDLE, w.DWORD, w.DWORD, ctypes.POINTER(SID_AND_ATTRIBUTES),
-                                             w.DWORD, ctypes.c_void_p, w.DWORD, ctypes.c_void_p,
-                                             ctypes.POINTER(w.HANDLE)]
-    advapi.ImpersonateLoggedOnUser.argtypes = [w.HANDLE]
-    token = w.HANDLE()
-    # TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_IMPERSONATE
-    if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x0002 | 0x0008 | 0x0001 | 0x0004,
-                                   ctypes.byref(token)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    admins = ctypes.c_void_p()
-    if not advapi.ConvertStringSidToSidW("S-1-5-32-544", ctypes.byref(admins)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    disable = (SID_AND_ATTRIBUTES * 1)(SID_AND_ATTRIBUTES(admins, 0))
-    filtered = w.HANDLE()
-    # DISABLE_MAX_PRIVILEGE: what a UAC-filtered token keeps, i.e. no backup/restore bypass.
-    if not advapi.CreateRestrictedToken(token, 0x1, 1, disable, 0, None, 0, None, ctypes.byref(filtered)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    if not advapi.ImpersonateLoggedOnUser(filtered):
-        raise ctypes.WinError(ctypes.get_last_error())
-
-    def usable(directory):
-        try:
-            fd = os.open(Path(directory) / "probe.lock", os.O_CREAT | os.O_WRONLY, 0o600)
-        except PermissionError:
-            return False
-        os.close(fd)
-        return True
-""")
 
 _DROP_PRIVILEGES = textwrap.dedent(r"""
     import ctypes, ctypes.wintypes as w, json, os, sys
@@ -96,6 +56,53 @@ _DROP_PRIVILEGES = textwrap.dedent(r"""
             raise ctypes.WinError(ctypes.get_last_error())
 """)
 
+# SeBackup/SeRestore are REMOVED from the process token first (as in
+# tests/tools/test_bot_live_delivery_windows_acl.py): CPython opens with FILE_FLAG_BACKUP_SEMANTICS, so an
+# elevated runner token that kept either would bypass every ACE even under the restricted token.
+_FILTERED_TOKEN = _DROP_PRIVILEGES + textwrap.dedent(r"""
+    import subprocess
+
+    class SID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", w.DWORD)]
+
+    kernel.GetCurrentProcess.restype = w.HANDLE
+    advapi.OpenProcessToken.argtypes = [w.HANDLE, w.DWORD, ctypes.POINTER(w.HANDLE)]
+    advapi.ConvertStringSidToSidW.argtypes = [w.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    advapi.CreateRestrictedToken.argtypes = [w.HANDLE, w.DWORD, w.DWORD, ctypes.POINTER(SID_AND_ATTRIBUTES),
+                                             w.DWORD, ctypes.c_void_p, w.DWORD, ctypes.c_void_p,
+                                             ctypes.POINTER(w.HANDLE)]
+    advapi.ImpersonateLoggedOnUser.argtypes = [w.HANDLE]
+    token = w.HANDLE()
+    # TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_IMPERSONATE
+    if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x0002 | 0x0008 | 0x0001 | 0x0004,
+                                   ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    admins = ctypes.c_void_p()
+    if not advapi.ConvertStringSidToSidW("S-1-5-32-544", ctypes.byref(admins)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    disable = (SID_AND_ATTRIBUTES * 1)(SID_AND_ATTRIBUTES(admins, 0))
+    filtered = w.HANDLE()
+    # DISABLE_MAX_PRIVILEGE: what a UAC-filtered token keeps, i.e. no backup/restore bypass.
+    if not advapi.CreateRestrictedToken(token, 0x1, 1, disable, 0, None, 0, None, ctypes.byref(filtered)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not advapi.ImpersonateLoggedOnUser(filtered):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    def usable(directory):
+        try:
+            fd = os.open(Path(directory) / "probe.lock", os.O_CREAT | os.O_WRONLY, 0o600)
+        except PermissionError:
+            return False
+        os.close(fd)
+        return True
+
+    def runner_identity(directory):
+        who = subprocess.run(["whoami", "/user", "/groups", "/priv"], capture_output=True, text=True,
+                             check=False).stdout
+        acl = subprocess.run(["icacls", str(directory)], capture_output=True, text=True, check=False).stdout
+        return who + "\n" + acl
+""")
+
 _REPORTERS_DACL = ["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"]
 
 
@@ -123,11 +130,40 @@ def reporters_parent(tmp_path):
     subprocess.run(["icacls", str(parent), "/reset", "/t", "/c", "/q"], check=False, capture_output=True)
 
 
+def _require_faithful_probe(reporters_parent: Path, reporters_dir: Path) -> None:
+    """Skip (never xfail) when this runner cannot stand in for the reporters' machine.
+
+    Two preconditions, each proved by the same filtered child the fix is checked with: it must be
+    refused by an Everyone:(DENY)(F) ACE (no privilege bypass left at all), and by the reporters'
+    SYSTEM + Administrators DACL on *reporters_dir* (no other identity on the runner's token that
+    DACL still grants). Only a failed precondition skips; the fix's own assertion always runs here.
+    """
+    denied = reporters_parent.parent / "everyone-denied"
+    denied.mkdir()
+    subprocess.run(["icacls", str(denied), "/deny", "*S-1-1-0:(F)"], check=True, capture_output=True)
+    try:
+        probe = _child("""
+            plain = usable(sys.argv[2])
+            print(json.dumps({"denied": usable(sys.argv[1]), "plain": plain,
+                              "identity": runner_identity(sys.argv[2]) if plain else ""}))
+        """, str(denied), str(reporters_dir))
+    finally:
+        subprocess.run(["icacls", str(denied), "/remove:d", "*S-1-1-0"], check=False, capture_output=True)
+    if probe["denied"]:
+        pytest.skip("precondition failed: the filtered child still opens a dir an Everyone:(DENY)(F) ACE "
+                    "refuses, so it bypasses ACLs on this runner and cannot judge the fix")
+    if probe["plain"]:
+        pytest.skip("precondition failed: this runner's filtered token is still granted by the reporters' "
+                    "SYSTEM + Administrators DACL, so a dir without the fix is not unusable here:\n"
+                    + probe["identity"])
+
+
 def test_dir_made_while_elevated_stays_usable_by_the_filtered_token(reporters_parent):
     from hermes_dir_acl import make_user_dir
 
     plain = reporters_parent / "plain"
     plain.mkdir()  # inherits the reporters' SYSTEM + Administrators DACL
+    _require_faithful_probe(reporters_parent, plain)
     granted = make_user_dir(reporters_parent / "gateway-locks", 0o700)
     result = _child("""
         print(json.dumps({"plain": usable(sys.argv[1]), "granted": usable(sys.argv[2])}))
@@ -141,12 +177,12 @@ def test_elevated_rerun_repairs_a_dir_an_earlier_elevated_run_left(reporters_par
 
     left = reporters_parent / "state"
     left.mkdir()
-    before = _child("print(json.dumps({'usable': usable(sys.argv[1])}))", str(left))
+    _require_faithful_probe(reporters_parent, left)
     make_user_dir(left, parents=True, exist_ok=True)  # how every production caller re-enters
     make_user_dir(left, parents=True, exist_ok=True)  # idempotent: no second ACE
     after = _child("print(json.dumps({'usable': usable(sys.argv[1])}))", str(left))
     acl = subprocess.run(["icacls", str(left)], capture_output=True, text=True, check=True).stdout
-    assert before["usable"] is False and after["usable"] is True, acl
+    assert after["usable"] is True, acl
 
 
 def test_token_lock_on_an_unusable_lock_dir_parks_with_one_named_warning(tmp_path):
