@@ -5,9 +5,7 @@ still resolves/monkeypatches. Origin helpers are imported lazily per function (n
 test patches on ``update_cmd`` stay effective).
 """
 
-import csv
 import logging
-import re
 from contextlib import suppress
 import os
 import subprocess
@@ -22,55 +20,37 @@ from datetime import UTC
 # Log-record parity with the origin module.
 logger = logging.getLogger("hermes_cli.update_cmd")
 
-_WINDOWS_SID = re.compile(r"S-\d+(?:-\d+)+\Z", re.IGNORECASE)
-
-
-def _windows_home_acl_grant_command(home: Path, sid: str) -> list[str]:
-    """Grant the calling user inherited access to an elevated update's home tree."""
-    return ["icacls", str(home), "/grant", f"*{sid}:(OI)(CI)F", "/T", "/C", "/Q"]
-
-
-def _current_windows_user_sid() -> str:
-    """Return the process user's SID without depending on localized account names."""
-    result = subprocess.run(
-        ["whoami", "/user", "/fo", "csv", "/nh"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
-    )
-    if result.returncode:
-        detail = result.stderr.strip() or f"whoami exited {result.returncode}"
-        raise RuntimeError(f"could not resolve the current Windows user SID: {detail}")
-    for row in csv.reader(result.stdout.splitlines()):
-        for value in row:
-            if _WINDOWS_SID.fullmatch(value.strip()):
-                return value.strip()
-    raise RuntimeError("could not parse the current Windows user SID")
-
 
 def _repair_windows_home_acl() -> None:
     """Restore access for the filtered UAC token after an elevated update.
 
     An elevated process can create home-tree entries whose DACL only grants
     Administrators and SYSTEM.  Administrators is deny-only in the normal UAC
-    token, so grant the actual user SID explicitly and recurse over entries
-    already created by the update.
+    token, so grant the actual user SID explicitly on every entry under the home.
+
+    The walk never descends into or grants through a junction, symlink or hard link
+    (``hermes_dir_acl.grant_tree_user_access``): ``icacls /T`` follows junctions, so a
+    same-user junction inside the home would have turned the elevated grant into full
+    control of e.g. ``C:\\Program Files\\X``.
     """
     if sys.platform != "win32":
         return
-    from hermes_dir_acl import process_is_elevated
+    from hermes_dir_acl import grant_tree_user_access, process_is_elevated
     if not process_is_elevated():
         # Only an elevated update leaves Administrators-only entries, and only an elevated token
-        # can rewrite them; a recursive icacls over the whole home on every update costs minutes.
+        # can rewrite them; a recursive grant over the whole home on every update costs minutes.
         return
     from hermes_constants import get_hermes_home
 
     home = get_hermes_home()
-    result = subprocess.run(
-        _windows_home_acl_grant_command(home, _current_windows_user_sid()),
-        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=900,
-    )
-    if result.returncode:
-        detail = result.stderr.strip() or result.stdout.strip() or f"icacls exited {result.returncode}"
-        raise RuntimeError(f"could not restore user access to {home}: {detail}")
+    granted, _skipped, failed = grant_tree_user_access(home)
+    if failed and not granted:
+        path, reason = failed[0]
+        raise RuntimeError(f"could not restore user access to {home}: {path}: {reason}")
+    if failed:
+        # Like icacls /C: keep going, report the first few; the step stays owed only when nothing took.
+        logger.warning("Restoring user access under %s failed for %d entr%s, e.g. %s: %s", home, len(failed),
+                       "y" if len(failed) == 1 else "ies", failed[0][0], failed[0][1])
 
 
 def _prepare_updated_checkout(project_root: Path, *, desktop: bool) -> None:
