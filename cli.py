@@ -1057,7 +1057,11 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         display_key = self.api_key
         if self.agent is not None and getattr(self.agent, "api_key", None):
             display_key = self.agent.api_key
-        if is_token_provider(display_key):
+        if is_token_provider(display_key) and getattr(display_key, "__module__", "") == "agent.vertex_adapter":
+            # Vertex's callable mints a Google OAuth token on first use (the gateway mints its own
+            # for the turn); never mint one just to mask it here.
+            api_key_display = _t("cli.config.google_vertex_oauth")
+        elif is_token_provider(display_key):
             api_key_display = _t("cli.config.microsoft_entra_id")
         elif isinstance(display_key, str) and len(display_key) > 12:
             api_key_display = f"{display_key[:8]}...{display_key[-4:]}"

@@ -3112,6 +3112,7 @@ cli:
     loaded: "(geladen)"
     not_found: "(nicht gefunden)"
     microsoft_entra_id: "Microsoft Entra ID"
+    google_vertex_oauth: "Google OAuth (Vertex AI)"
     api_key_not_set: "Nicht gesetzt!"
     value_not_set: "nicht gesetzt"
     section_model: "Modell"

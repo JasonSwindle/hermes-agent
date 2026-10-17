@@ -3112,6 +3112,7 @@ cli:
     loaded: "(завантажено)"
     not_found: "(не знайдено)"
     microsoft_entra_id: "Microsoft Entra ID"
+    google_vertex_oauth: "Google OAuth (Vertex AI)"
     api_key_not_set: "Не задано!"
     value_not_set: "не задано"
     section_model: "Модель"
