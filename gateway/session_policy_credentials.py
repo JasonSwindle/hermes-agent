@@ -78,12 +78,56 @@ def _fingerprint(value):
     return fingerprint_secret_value(value if isinstance(value, str) else json.dumps(value, sort_keys=True))
 
 
+# What a frozen secret authenticates: the endpoint fields of the block that holds it (``model:``, a
+# ``providers:`` entry, an MCP server). A secret is bound to these, never to the rest of the policy.
+_ENDPOINT_KEYS = ('provider', 'base_url', 'url', 'command', 'args', 'api_mode')
+
+
+def _binding(config, path):
+    """Digest of the endpoint the secret at *path* authenticates in the frozen *config* (a terminal-scope
+    secret, ``path[0] is None``, authenticates no endpoint)."""
+    block = _defined(config, path[:-1]) if path and path[0] is not None else _ABSENT
+    endpoint = {k: block[k] for k in _ENDPOINT_KEYS if k in block} if isinstance(block, dict) else {}
+    return hashlib.sha256(json.dumps([list(path), endpoint], sort_keys=True).encode()).hexdigest()
+
+
 def config_reference(authority, session_id, policy, secrets):
     home = Path(authority.db.db_path).resolve().parent
+    config = json.loads(policy.config_json)
     return PREFIX + json.dumps({'home': str(home), 'profile': authority.profile_id,
+        # ``policy`` (the whole-policy hash) is still written for an older gateway reading this reference;
+        # this gateway checks ``bound``: each secret against the endpoint it authenticates (CFG-10).
         'session': session_id, 'policy': policy_identity(policy),
+        'bound': [[list(path), _binding(config, path)] for path in secrets],
         'entries': [[list(path), _fingerprint(value)] for path, value in secrets.items()]},
         sort_keys=True)
+
+
+def _field(path):
+    return '.'.join(str(part) for part in path if part is not None)
+
+
+def _check_scope(authority, source, policy, home, skip):
+    """Refuse, by name, a reference from another home or profile, or a secret whose endpoint the policy
+    moved without re-binding it. A change to anything else in the policy (model name, reasoning, toolsets,
+    an unrelated provider or MCP server, a policy field a later release added) is not a credential change."""
+    for name, mine in (('home', str(home)), ('profile', authority.profile_id)):
+        if source[name] != mine:
+            raise RuntimeStoreError('launch_credentials_unavailable', field=name,
+                                    detail=f'the frozen config credentials belong to another {name}')
+    if 'bound' not in source:
+        # Stamped before ``bound``: its whole-policy hash also covers fields an older gateway did not
+        # know and settings no secret depends on, so a mismatch alone proves no credential change. The
+        # per-entry fingerprints below still gate every value; the next re-bind writes ``bound``.
+        if source['policy'] != policy_identity(policy):
+            logger.warning('Session %s: frozen config reference predates scoped credential binding; '
+                           'verifying its entries by fingerprint', source.get('session'))
+        return
+    config = json.loads(policy.config_json)
+    for path, digest in source['bound']:
+        if path[0] not in skip and not hmac.compare_digest(_binding(config, path), digest):
+            raise RuntimeStoreError('launch_credentials_unavailable', field=_field(path),
+                                    detail='its endpoint moved in the session policy without a re-bind')
 
 
 def secrets_moved(ref, secrets, sections):
@@ -112,20 +156,7 @@ def recover_config_secrets(authority, policy, skip=None):
     try:
         source = json.loads(ref[len(PREFIX):])
         home = Path(authority.db.db_path).resolve().parent
-        if source['home'] != str(home) or source['profile'] != authority.profile_id:
-            raise RuntimeStoreError('launch_credentials_unavailable',
-                field='home' if source['home'] != str(home) else 'profile',
-                detail='receipt scope mismatch: the frozen config reference belongs to another '
-                       + ('home' if source['home'] != str(home) else 'profile'))
-        if source['policy'] != policy_identity(policy):
-            # The stamp covers the whole frozen config_json, secret fields and not: a profile edit
-            # that rewrote the snapshot after the reference froze (a repointed base_url, keys
-            # unchanged) fails it without touching a single secret, stranding the session on every
-            # turn -- and on the /model re-stamp and the policy refresh that would repair it. The
-            # per-entry fingerprints below still gate every value against the live config.yaml and
-            # still refuse a changed route credential, so a stale stamp degrades to that check.
-            logger.warning('Session %s: frozen config reference predates the current policy snapshot; '
-                           'verifying its entries per fingerprint', source.get('session'))
+        _check_scope(authority, source, policy, home, skip)
         cached = getattr(authority, '_local_config_secrets', {}).get(ref)
         if cached is not None:
             return {path: value for path, value in cached.items() if path[0] not in skip}
@@ -145,8 +176,7 @@ def recover_config_secrets(authority, policy, skip=None):
                 if route is None:
                     route = _route_paths(policy)
                 if tuple(path) in route:
-                    raise RuntimeStoreError('launch_credentials_unavailable',
-                        field='.'.join(str(part) for part in path if part is not None),
+                    raise RuntimeStoreError('launch_credentials_unavailable', field=_field(path),
                         detail=('removed from' if value is _ABSENT else 'changed in')
                         + ' config.yaml since this session started')
                 # Any other secret (an MCP env token, an unused provider's key) is simply no longer
@@ -161,7 +191,9 @@ def recover_config_secrets(authority, policy, skip=None):
     except RuntimeStoreError:
         raise
     except (KeyError, TypeError, ValueError, AttributeError, OSError) as exc:
-        raise RuntimeStoreError('launch_credentials_unavailable') from exc
+        logger.warning('Frozen config reference unreadable: %s', type(exc).__name__)
+        raise RuntimeStoreError('launch_credentials_unavailable', field='config_secret_ref',
+                                detail=f'unreadable ({type(exc).__name__})') from exc
 
 
 def _entry_owner_path(entry, config):
