@@ -91,7 +91,8 @@ def test_vertex_config_label_and_background_task_through_the_gateway(tmp_path: P
     def submit(line: str) -> None:
         tmux("send-keys", "-t", "p", "-l", line)
         wait_for(f"\u276f {line}", timeout=20)
-        time.sleep(0.5)
+        # An Enter within 50 ms of the last buffer change reads as a pasted newline.
+        time.sleep(0.5)  # health: allow HX013 -- the gap IS the behaviour: the CLI's paste detection is time-based
         tmux("send-keys", "-t", "p", "Enter")
 
     # `-t file` like the sibling Vertex suites: the default toolset trips #109115 (terminal.notify's
@@ -101,13 +102,11 @@ def test_vertex_config_label_and_background_task_through_the_gateway(tmp_path: P
                     "-c", str(nh.project), *argv], env=env, check=True, timeout=30)
     try:
         tmux("set", "-g", "remain-on-exit", "on")
-        wait_for("\u2624 ", timeout=120)  # the status bar: the app owns the terminal
-        time.sleep(2.0)
+        wait_for("\u2624 ", timeout=120)  # the status bar: the app owns the terminal (raw mode)
 
         # The CLI resolves its route at the first turn (as main did); /config reads that route.
         submit("hello vertex")
         wait_for("foreground ok", timeout=120)
-        time.sleep(1.0)
 
         mints_before_config = len(fake.token_requests)
         submit("/config")

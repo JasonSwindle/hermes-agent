@@ -202,10 +202,15 @@ class Pane:
                 return
             time.sleep(0.2)
 
+    def paste_gap(self) -> None:
+        """Keep the next key out of the input batch the app is still reading: prompt_toolkit takes an
+        Enter that lands within 50 ms of the last buffer change for a pasted newline."""
+        time.sleep(1.2)  # health: allow HX013 -- the gap IS the behaviour: the CLI's paste detection is time-based
+
     def submit(self, text: str) -> None:
         self.tmux("send-keys", "-t", "p", "-l", text)
         self.wait([f"{PROMPT} {text}"[-40:]], 10)
-        time.sleep(1.2)
+        self.paste_gap()
         self.keys("Enter")
 
     def wait_dead(self, timeout: float = 30.0) -> bool:
@@ -218,7 +223,6 @@ class Pane:
         """Wait for the running app's status bar (painted in raw mode), then let startup settle."""
         hit = self.wait([STATUS_BAR], timeout)
         self.settle(quiet=3.0, timeout=30)
-        time.sleep(1.5)
         return hit
 
     def kill(self) -> None:
