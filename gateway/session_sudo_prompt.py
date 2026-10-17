@@ -22,13 +22,16 @@ _POLL_S = 0.25
 
 
 class _Pending:
-    __slots__ = ("event", "result", "session_id", "value")
+    __slots__ = ("event", "locked", "qids", "result", "session_id", "value")
 
-    def __init__(self, session_id):
+    def __init__(self, session_id, qids=None):
         self.event = threading.Event()
         self.session_id = session_id
         self.value = ""
         self.result = None
+        # A batch clarify: its question ids and the answers ``clarify.lock`` has locked so far.
+        self.qids = tuple(qids) if qids else None
+        self.locked = {}
 
 
 _lock = threading.Lock()
@@ -50,6 +53,11 @@ def resolve(frame, *, session_ok=lambda session_id: True) -> bool:
             return False
         _open.pop(frame["id"], None)
     result = frame.get("result") if "error" not in frame else None
+    if pending.qids is not None and pending.locked and isinstance(result, dict):
+        # Answers locked early belong to the final set even when the closing frame omits them
+        # (a cancel after two locks keeps those two), as main's ``server_requests`` merged them.
+        answers = result.get("answers") if isinstance(result.get("answers"), dict) else {}
+        result = {**result, "answers": {**pending.locked, **answers}}
     value = result.get("value") if isinstance(result, dict) else ""
     pending.value = value if isinstance(value, str) else ""
     pending.result = result if isinstance(result, dict) else None
@@ -70,18 +78,41 @@ def ask_viewer(events, session_id, method, params, *, cancelled=lambda: False, t
     return pending.value if pending is not None else ""
 
 
-def ask_viewer_result(events, session_id, method, params, *, cancelled=lambda: False, timeout=SUDO_TIMEOUT_S):
+def ask_viewer_result(events, session_id, method, params, *, cancelled=lambda: False, timeout=SUDO_TIMEOUT_S,
+                      qids=None):
     """The same round trip for a structured answer (``clarify``: ``ClarifyResult``): the viewer's
-    ``result`` dict, or None on interrupt, timeout, an error response or no attached viewer."""
-    pending = _ask(events, session_id, method, params, cancelled=cancelled, timeout=timeout)
+    ``result`` dict, or None on interrupt, timeout, an error response or no attached viewer.
+    ``qids`` makes it a batch: ``lock_answer`` (the ``clarify.lock`` verb) answers it per question."""
+    pending = _ask(events, session_id, method, params, cancelled=cancelled, timeout=timeout, qids=qids)
     return pending.result if pending is not None else None
 
 
-def _ask(events, session_id, method, params, *, cancelled, timeout):
+def lock_answer(request_id, question_id, answer, *, session_ok=lambda session_id: False):
+    """Lock one answer of an open batch request (``clarify.lock``; editable until the last lock;
+    ``None`` = skipped). Returns the question ids still unanswered; the lock that empties it settles
+    the request with ``{answers, outcome: submitted}``. ``None`` when no open batch has that id or the
+    caller may not answer its session (expired or foreign); ``ValueError`` for an unknown question id."""
+    with _lock:
+        pending = _open.get(request_id)
+        if pending is None or pending.qids is None or not session_ok(pending.session_id):
+            return None
+        if question_id not in pending.qids:
+            raise ValueError(question_id)
+        pending.locked[question_id] = answer
+        remaining = [qid for qid in pending.qids if qid not in pending.locked]
+        if not remaining:
+            _open.pop(request_id, None)
+            pending.result = {"answers": dict(pending.locked), "outcome": "submitted"}
+    if not remaining:
+        pending.event.set()
+    return remaining
+
+
+def _ask(events, session_id, method, params, *, cancelled, timeout, qids=None):
     if not events.fanout.transports():
         return None
     request_id = f"srq-{uuid.uuid4().hex[:12]}"
-    pending = _Pending(session_id)
+    pending = _Pending(session_id, qids)
     with _lock:
         _open[request_id] = pending
     events.fanout.write({"jsonrpc": "2.0", "id": request_id, "method": method,

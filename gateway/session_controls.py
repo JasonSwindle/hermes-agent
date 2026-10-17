@@ -188,6 +188,8 @@ class AuthorityConnection:
         handlers['session.automation'] = partial(automation, self)
         from gateway.session_reactions import react
         handlers['message.react'] = partial(react, self)
+        from gateway.session_clarify_lock import clarify_lock
+        handlers['clarify.lock'] = partial(clarify_lock, self)
         from gateway.session_control_actions import control
         handlers['session.control'] = partial(control, self)
         return handlers

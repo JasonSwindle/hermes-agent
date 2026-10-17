@@ -25,8 +25,10 @@ def ask_clarify_batch(turn, questions) -> dict:
         return {"answers": {}, "outcome": "cancelled"}
     wire = [{key: entry.get(key) for key in _QUESTION_KEYS if entry.get(key) is not None} for entry in questions]
     timeout = get_clarify_timeout()
+    # ``qids``: the viewer's batch panel locks each answer with ``clarify.lock`` (#140400).
     result = ask_viewer_result(live.event_stream, session_id, "clarify", {"questions": wire},
-                               cancelled=interrupted, timeout=timeout if timeout > 0 else None)
+                               cancelled=interrupted, timeout=timeout if timeout > 0 else None,
+                               qids=[entry["qid"] for entry in questions])
     if result is None:
         return {"answers": {}, "outcome": "cancelled" if interrupted() else "timed_out"}
     answers = result.get("answers")
