@@ -221,11 +221,33 @@ _NATIVE_WINDOWS = os.name == "nt"
 
 
 def _owner_pid(home: Path) -> int | None:
-    from gateway.status import _pid_from_record, _read_json_file
+    """The PID a refusal may name: one of *home*'s gateway records whose process is provably that
+    gateway, else None (the caller keeps the generic ``authorization``).
+
+    Proof is the shared identity chain: alive, its recorded start time known and equal to the live
+    one (a recycled PID differs), its recorded home not another profile's, and its live command line
+    (or, when that is unreadable across the elevation boundary, its record) a gateway's. A stale
+    ``gateway.pid`` falls through to ``gateway.lock`` instead of masking it."""
+    from gateway.status import (
+        _get_process_start_time,
+        _live_pid_from_record,
+        _read_json_file,
+        _record_matches_live_gateway_pid,
+        recorded_gateway_home_conflicts,
+    )
     for name in ("gateway.pid", "gateway.lock"):
-        pid = _pid_from_record(_read_json_file(home / name, bare_pid_ok=True))
-        if pid and pid != os.getpid():
-            return pid
+        record = _read_json_file(home / name, bare_pid_ok=True)
+        pid = _live_pid_from_record(record)
+        if pid is None or pid == os.getpid():
+            continue
+        recorded = record.get("start_time")
+        if recorded is None or recorded != _get_process_start_time(pid):
+            continue  # unverifiable or recycled: never name it
+        if recorded_gateway_home_conflicts(record, expected_home=home):
+            continue
+        if not _record_matches_live_gateway_pid(record, pid):
+            continue
+        return pid
     return None
 
 
