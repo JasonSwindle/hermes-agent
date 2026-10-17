@@ -1,6 +1,7 @@
 """``make_user_dir`` contract off Windows and its grant selection (the Windows ACL effect itself is
 proved by ``test_hermes_dir_acl_windows.py`` on Windows CI)."""
 import os
+from pathlib import Path
 
 import pytest
 
@@ -236,3 +237,47 @@ def test_icacls_fallback_still_grants_a_plain_subtree(tmp_path, monkeypatch):
     monkeypatch.setattr(hermes_dir_acl.subprocess, "run", lambda argv, **_k: calls.append(argv))
     hermes_dir_acl._grant_with_icacls(root, True, str(root))
     assert [c[0] for c in calls] == ["icacls"] and "/L" in calls[0]
+
+
+def test_a_recreated_dir_is_granted_again(tmp_path, monkeypatch):
+    """Review-9 (c): the grant memo was keyed by pathname, so media release deleting a digest dir
+    and the next capture recreating it at the same path left the new dir without the grant."""
+    granted = []
+    monkeypatch.setattr(hermes_dir_acl.sys, "platform", "win32")
+    monkeypatch.setattr(hermes_dir_acl, "process_is_elevated", lambda: True)
+    monkeypatch.setattr(hermes_dir_acl, "grant_user_access", lambda p: granted.append(p) or True)
+    monkeypatch.setattr(hermes_dir_acl, "_granted", set())
+    target = tmp_path / "native-inputs" / ("0" * 64)
+    hermes_dir_acl.make_user_dir(target, 0o700, parents=True, exist_ok=True)
+    hermes_dir_acl.make_user_dir(target, 0o700, exist_ok=True)
+    assert granted.count(target) == 1  # existing object: memoized
+    target.rmdir()
+    hermes_dir_acl.make_user_dir(target, 0o700, exist_ok=True)
+    assert granted.count(target) == 2, "the recreated directory never got the grant"
+
+
+def test_media_release_then_recapture_grants_the_recreated_digest_dir(tmp_path, monkeypatch):
+    """The production lifecycle behind (c): capture -> release_unheld_media -> capture again."""
+    from gateway import session_ingress_media as media
+    from hermes_state import SessionDB
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(hermes_dir_acl.sys, "platform", "win32")
+    monkeypatch.setattr(hermes_dir_acl, "process_is_elevated", lambda: True)
+    monkeypatch.setattr(hermes_dir_acl, "_granted", set())
+    grants = []
+    monkeypatch.setattr(hermes_dir_acl, "_grant_with_pywin32", lambda path, *_a, **_k: grants.append(str(path)))
+    source = tmp_path / "sample.txt"
+    source.write_text("same attachment bytes")
+    db = SessionDB(db_path=home / "state.db")
+    try:
+        first = media.capture_native_media([source])
+        directory = str(Path(first[0]["path"]).parent)
+        assert media.release_unheld_media(db, first, retain_history=False) == 1
+        assert not Path(directory).exists()
+        assert media.capture_native_media([source]) == first
+    finally:
+        db.close()
+    assert grants.count(directory) == 2

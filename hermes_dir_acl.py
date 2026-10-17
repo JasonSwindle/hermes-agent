@@ -313,9 +313,19 @@ def grant_tree_user_access(root: str | Path) -> tuple[int, list[Path], list[tupl
     return granted, skipped, failed
 
 
-# Dirs this elevated process already granted: the grant reads and may rewrite a DACL, and the
-# callers (log handlers, lock acquires) re-enter on hot paths.
-_granted: set[Path] = set()
+# Dir OBJECTS this elevated process already granted, as ``(path, volume serial, file id)`` from
+# ``os.lstat`` (st_dev / st_ino are exactly those on Windows): the grant reads and may rewrite a
+# DACL, and the callers (log handlers, lock acquires) re-enter on hot paths. Keyed by identity, not
+# name: media release deletes a digest dir and the next capture recreates it at the same path.
+_granted: set[tuple[Path, int, int]] = set()
+
+
+def _identity(path: Path) -> tuple[Path, int, int] | None:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return path, st.st_dev, st.st_ino
 
 
 def make_user_dir(path: str | Path, mode: int = 0o777, *, parents: bool = False, exist_ok: bool = False) -> Path:
@@ -323,8 +333,8 @@ def make_user_dir(path: str | Path, mode: int = 0o777, *, parents: bool = False,
     by the same user unelevated.
 
     Off Windows or unelevated this is ``Path.mkdir`` and nothing else. Elevated, every directory
-    this call created (missing parents included) and the leaf, even when it already existed (the
-    repair case), get the user's inheriting full-control ACE once per process, except that a
+    this call created (missing parents included) is granted the user's inheriting full-control ACE,
+    and an existing leaf (the repair case) once per directory object per process, except that a
     component that is a junction/symlink/reparse point stops the grants with one warning. An
     existing leaf without ``exist_ok`` is still granted before the ``FileExistsError``."""
     target = Path(path)
@@ -345,11 +355,13 @@ def make_user_dir(path: str | Path, mode: int = 0o777, *, parents: bool = False,
         if target.is_dir() and not is_reparse_point(target):
             _grant_dirs(target, [target])
         raise
-    _grant_dirs(target, list(reversed(created or [target])))
+    _grant_dirs(target, list(reversed(created or [target])), fresh=set(created))
     return target
 
 
-def _grant_dirs(target: Path, to_grant: list[Path]) -> None:
+def _grant_dirs(target: Path, to_grant: list[Path], fresh: set[Path] = frozenset()) -> None:
+    """Grant *to_grant*; a dir in *fresh* (this call created it) is always granted, an existing
+    one once per verified object identity."""
     # A junction/symlink planted at (or swapped in for) the leaf, a created component, or any
     # existing ancestor inside the home: grant nothing, one warning (nothing past it is in the home).
     for component in dict.fromkeys([*_components_below_home(target), *to_grant]):
@@ -357,8 +369,11 @@ def _grant_dirs(target: Path, to_grant: list[Path]) -> None:
             _warn_refused(component, ReparsePointRefused("junction, symlink or other reparse point"))
             return
     for directory in to_grant:
-        if directory not in _granted and grant_user_access(directory):
-            _granted.add(directory)
+        key = _identity(directory)
+        if key is None or (directory not in fresh and key in _granted):
+            continue
+        if grant_user_access(directory):
+            _granted.add(key)
 
 
 def unusable_dir_remedy(path: str | Path) -> str:
