@@ -278,6 +278,7 @@ _UPDATE_PIPELINE = (
     "hermes_cli/git_pack_tidy.py",  # partial-clone pack tidy: every update's pre-fetch runs it
     "hermes_bootstrap.py",  # every launch's prepare_launch
     "hermes_constants.py",  # root home = update marker location
+    "hermes_dir_acl.py",  # update restores the Windows user ACL on the home after elevation
     "gateway/status.py",  # code_sha stamp the fleet verify reads
     "gateway/status_inline_source.py",  # the Windows pause identifies inline-bootstrapped gateways
     "gateway/control_socket.py",  # pause-for-update verb
