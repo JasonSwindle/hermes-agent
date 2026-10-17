@@ -166,10 +166,15 @@ def _grant_with_icacls(path: Path, is_dir: bool, expected: str | None = None) ->
     if is_dir:
         # icacls applies an inheritable ACE through SetNamedSecurityInfo, which also propagates it
         # down the existing subtree; refuse when that subtree holds a link it could descend into.
+        # Walk the WHOLE subtree before judging: the generator appends a link it meets after its
+        # last yield, so checking inside the loop admitted a tree whose only link came last. A
+        # hard-linked file is refused too: the inherited ACE lands on its other names outside.
         nested: list[Path] = []
-        for _ in iter_tree_without_reparse_points(path, nested):
-            if nested:
-                raise ReparsePointRefused(f"{nested[0]} under {path} is a junction or link (icacls fallback)")
+        linked = [entry for entry, entry_is_dir in iter_tree_without_reparse_points(path, nested)
+                  if not entry_is_dir and _hard_linked_file(entry)]
+        if nested or linked:
+            raise ReparsePointRefused(f"{(nested + linked)[0]} under {path} is a junction, symlink or hard "
+                                      "link (icacls fallback)")
     ace = f"*{_whoami_sid()}:(OI)(CI)F" if is_dir else f"*{_whoami_sid()}:F"
     # /L: act on a symbolic link or junction itself, not its target (the lstat check already refused
     # one; this covers a swap between that check and icacls opening the path). Without pywin32 there

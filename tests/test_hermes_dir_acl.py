@@ -199,3 +199,40 @@ def test_tree_grant_is_a_noop_unelevated(tmp_path, monkeypatch):
     monkeypatch.setattr(hermes_dir_acl.sys, "platform", "win32")
     monkeypatch.setattr(hermes_dir_acl, "process_is_elevated", lambda: False)
     assert hermes_dir_acl.grant_tree_user_access(tmp_path) == (0, [], [])
+
+
+@pytest.mark.parametrize("shape", ["symlink-only", "symlink-before-a-file", "hardlink-only", "nested-hardlink"])
+def test_icacls_fallback_refuses_any_link_in_the_subtree(tmp_path, monkeypatch, shape):
+    """Review-9 (b): the prewalk checked inside the loop, so a link met after the last yield
+    (a root holding only a link) was admitted, and a hard-linked file was never checked."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file").write_text("sentinel")
+    root = tmp_path / "home"
+    root.mkdir()
+    if shape.startswith("symlink"):
+        (root / "a-link").symlink_to(outside, target_is_directory=True)
+        if shape == "symlink-before-a-file":
+            (root / "z-file").write_text("x")
+    elif shape == "hardlink-only":
+        (root / "alias").hardlink_to(outside / "file")
+    else:
+        (root / "d").mkdir()
+        (root / "d" / "alias").hardlink_to(outside / "file")
+    monkeypatch.setattr(hermes_dir_acl, "_whoami_sid", lambda: "S-1-5-21-1-2-3-1001")
+    calls = []
+    monkeypatch.setattr(hermes_dir_acl.subprocess, "run", lambda argv, **_k: calls.append(argv))
+    with pytest.raises(hermes_dir_acl.ReparsePointRefused):
+        hermes_dir_acl._grant_with_icacls(root, True, str(root))
+    assert calls == []
+
+
+def test_icacls_fallback_still_grants_a_plain_subtree(tmp_path, monkeypatch):
+    root = tmp_path / "home"
+    (root / "d").mkdir(parents=True)
+    (root / "d" / "f").write_text("x")
+    monkeypatch.setattr(hermes_dir_acl, "_whoami_sid", lambda: "S-1-5-21-1-2-3-1001")
+    calls = []
+    monkeypatch.setattr(hermes_dir_acl.subprocess, "run", lambda argv, **_k: calls.append(argv))
+    hermes_dir_acl._grant_with_icacls(root, True, str(root))
+    assert [c[0] for c in calls] == ["icacls"] and "/L" in calls[0]
