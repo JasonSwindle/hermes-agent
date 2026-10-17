@@ -429,7 +429,12 @@ def mkdir_under_hermes_home(path: str | Path) -> Path:
     """Create *path*, but never materialize a deleted/missing named profile."""
     target = Path(path)
     assert_named_profile_home_live(target)
-    target.mkdir(parents=True, exist_ok=True)
+    try:  # lazy: this module is in the launcher's bootstrap closure and must import alone
+        from hermes_dir_acl import make_user_dir
+    except ImportError:
+        target.mkdir(parents=True, exist_ok=True)
+    else:
+        make_user_dir(target, parents=True, exist_ok=True)
     return target
 
 

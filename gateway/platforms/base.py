@@ -19,6 +19,7 @@ import uuid
 import weakref
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
+from hermes_dir_acl import make_user_dir, unusable_dir_remedy
 
 from utils import normalize_proxy_url
 from agent.i18n import t
@@ -605,7 +606,7 @@ def _secure_media_cache_dir(cache_dir: Path) -> None:
         if managed:
             cache_dir.mkdir(parents=True, exist_ok=True)
             return
-        cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        make_user_dir(cache_dir, parents=True, exist_ok=True, mode=0o700)
         try:
             from hermes_cli.config import _secure_dir
 
@@ -2212,10 +2213,23 @@ class BasePlatformAdapter(ABC):
         holder is replaced only when the runner armed this adapter for its initial
         ``--replace`` connect (the status module validates ownership and terminates)."""
         from gateway.status import (
-            acquire_scoped_lock, scoped_lock_owner_label, take_over_scoped_lock_holder)
+            ScopedLockDirUnusable, acquire_scoped_lock, scoped_lock_owner_label, take_over_scoped_lock_holder)
         self._platform_lock_scope, self._platform_lock_identity = scope, identity
         lock_meta = {"platform": self.platform.value}
-        acquired, existing = acquire_scoped_lock(scope, identity, metadata=lock_meta)
+        try:
+            acquired, existing = acquire_scoped_lock(scope, identity, metadata=lock_meta)
+        except ScopedLockDirUnusable as exc:
+            # An ACL no retry can change (an elevated install created the lock dir, #134889 W2):
+            # stay down with the repair named instead of a reconnect loop that fails identically.
+            # The status module already logged the WARNING (once per dir).
+            self._platform_lock_identity = None
+            self._set_fatal_error(
+                "lock_dir_unusable",
+                f"{resource_desc} lock cannot be taken: the gateway lock directory {exc.filename} is not "
+                f"usable by this user (likely created by an elevated Hermes). To repair, "
+                f"{unusable_dir_remedy(exc.filename)}, then restart the gateway.",
+                retryable=False)
+            return False
         if acquired:
             return True
         if (self._platform_lock_takeover_allowed and not self._platform_lock_takeover_attempted

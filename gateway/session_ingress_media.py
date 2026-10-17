@@ -16,6 +16,7 @@ import re
 import stat
 import tempfile
 import threading
+from hermes_dir_acl import make_user_dir
 
 from hermes_state_runtime import RuntimeStoreError
 from utils import fsync_directory
@@ -244,7 +245,7 @@ def capture_native_media(paths):
             root = target.parent.parent
             if target.parent.resolve() != target.parent:
                 raise RuntimeStoreError('invalid_params')
-            target.parent.mkdir(mode=0o700, exist_ok=True)
+            make_user_dir(target.parent, mode=0o700, exist_ok=True)
             with _lease_lock:
                 scope = _lease_scope.get()
                 if scope is not None:
@@ -273,7 +274,7 @@ def _capture_file(path, limit, total, references, staged):
         root = _media_root()
         if root.resolve() != root:
             raise RuntimeStoreError('invalid_params')
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        make_user_dir(root, mode=0o700, parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(prefix='.capture-', dir=root)
         temporary = Path(name)
         staged.append(temporary)
