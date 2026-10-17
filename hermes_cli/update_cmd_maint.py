@@ -34,7 +34,7 @@ def _current_windows_user_sid() -> str:
     """Return the process user's SID without depending on localized account names."""
     result = subprocess.run(
         ["whoami", "/user", "/fo", "csv", "/nh"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
     )
     if result.returncode:
         detail = result.stderr.strip() or f"whoami exited {result.returncode}"
@@ -56,12 +56,17 @@ def _repair_windows_home_acl() -> None:
     """
     if sys.platform != "win32":
         return
+    from hermes_dir_acl import process_is_elevated
+    if not process_is_elevated():
+        # Only an elevated update leaves Administrators-only entries, and only an elevated token
+        # can rewrite them; a recursive icacls over the whole home on every update costs minutes.
+        return
     from hermes_constants import get_hermes_home
 
     home = get_hermes_home()
     result = subprocess.run(
         _windows_home_acl_grant_command(home, _current_windows_user_sid()),
-        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=900,
     )
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip() or f"icacls exited {result.returncode}"

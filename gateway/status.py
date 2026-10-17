@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
-from hermes_dir_acl import make_user_dir, unusable_dir_remedy
+from hermes_dir_acl import make_user_dir
 
 from gateway.status_inline_source import (
     command_line_runs_inline_source,
@@ -29,6 +29,9 @@ from gateway.status_inline_source import (
 )
 from hermes_constants import _get_platform_default_hermes_home, get_hermes_home, get_process_hermes_home
 from hermes_cli._subprocess_compat import pid_exists_stdlib
+from gateway.status_scoped_locks import (  # re-exported: the public scoped-lock API lives on gateway.status
+    ScopedLockDirUnusable, _unusable_lock_dir, _warned_unusable_lock_dirs, release_all_scoped_locks,
+    release_scoped_lock)
 from utils import atomic_json_write
 
 if sys.platform == "win32":
@@ -1542,31 +1545,6 @@ def _process_is_stopped(pid: int) -> bool:
     return False
 
 
-class ScopedLockDirUnusable(PermissionError):
-    """This token cannot create, read or replace locks in the scoped-lock dir (#134889 W2).
-
-    On Windows an elevated install/update creates ``gateway-locks`` owned by Administrators with
-    no entry for the user; the same user's non-elevated gateway then gets ``Permission denied`` on
-    every token lock. Retrying cannot fix an ACL, so the adapter reports it once, names the repair
-    and stays down instead of crash-looping. A ``PermissionError`` subclass so existing callers
-    keep their handling.
-    """
-
-
-# Lock dirs already reported unusable by this process: WARNING once per dir, DEBUG after, since the
-# reconnect watcher and every adapter sharing the dir re-enter the acquire path.
-_warned_unusable_lock_dirs: set[Path] = set()
-
-
-def _unusable_lock_dir(lock_dir: Path, exc: PermissionError) -> ScopedLockDirUnusable:
-    level = logging.DEBUG if lock_dir in _warned_unusable_lock_dirs else logging.WARNING
-    _warned_unusable_lock_dirs.add(lock_dir)
-    logger.log(level, "Gateway lock directory %s is not usable by this process (%s); it was likely created "
-               "by an elevated (administrator) Hermes. Platforms that need a token lock stay down until it "
-               "is repaired. To repair, %s", lock_dir, exc, unusable_dir_remedy(lock_dir))
-    return ScopedLockDirUnusable(exc.errno, f"gateway lock directory is not usable: {exc}", str(lock_dir))
-
-
 def acquire_scoped_lock(
     scope: str, identity: str, metadata: Optional[dict[str, Any]] = None
 ) -> tuple[bool, Optional[dict[str, Any]]]:
@@ -1586,7 +1564,6 @@ def acquire_scoped_lock(
 def _acquire_scoped_lock_at(
     lock_path: Path, scope: str, identity: str, metadata: Optional[dict[str, Any]]
 ) -> tuple[bool, Optional[dict[str, Any]]]:
-    from hermes_dir_acl import make_user_dir
     make_user_dir(lock_path.parent, parents=True, exist_ok=True)
     # An existing lock this token may not read (left by an elevated gateway) must raise here:
     # ``_read_json_file`` would call it empty and O_EXCL "in use", a conflict with no holder.
@@ -1632,36 +1609,6 @@ def _acquire_scoped_lock_at(
     except FileExistsError:
         return False, _read_json_file(lock_path)
     return True, None
-
-
-def release_scoped_lock(scope: str, identity: str) -> None:
-    """Release a scope lock owned by this PID. No start_time equality check: on-disk null vs a live
-    fingerprint would wedge reconnects."""
-    lock_path = _get_scope_lock_path(scope, identity)
-    if (_read_json_file(lock_path) or {}).get("pid") == os.getpid():
-        _unlink_quietly(lock_path)
-
-
-def release_all_scoped_locks(
-    *, owner_pid: Optional[int] = None, owner_start_time: Optional[int] = None
-) -> int:
-    """Remove scoped lock files (--replace cleanup); returns the count removed. With ``owner_pid``
-    only that gateway's records go (``owner_start_time`` narrows against PID reuse)."""
-    lock_dir = _get_lock_dir()
-    if not lock_dir.exists():
-        return 0
-    removed = 0
-    for lock_file in lock_dir.glob("*.lock"):
-        if owner_pid is not None:
-            record = _read_json_file(lock_file) or {}
-            if _pid_from_record(record) != owner_pid or (
-                owner_start_time is not None and record.get("start_time") != owner_start_time
-            ):
-                continue
-        with contextlib.suppress(OSError):
-            lock_file.unlink(missing_ok=True)
-            removed += 1
-    return removed
 
 
 # ── --replace takeover marker ─────────────────────────────────────────

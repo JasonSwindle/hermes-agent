@@ -86,12 +86,12 @@ def _grant_with_pywin32(path: Path) -> None:
 
 def _grant_with_icacls(path: Path) -> None:
     whoami = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True,
-                            check=True, encoding="utf-8", errors="replace")
+                            check=True, encoding="utf-8", errors="replace", timeout=30)
     sid = whoami.stdout.strip().rsplit(",", 1)[-1].strip().strip('"')
     if not sid.upper().startswith("S-1-"):
         raise OSError(f"could not resolve the current user SID from whoami: {whoami.stdout!r}")
     subprocess.run(["icacls", str(path), "/grant", f"*{sid}:(OI)(CI)F", "/Q"], capture_output=True,
-                   check=True)
+                   check=True, timeout=60)
 
 
 def grant_user_access(path: str | Path) -> bool:

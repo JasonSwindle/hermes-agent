@@ -18,8 +18,8 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
-from urllib.parse import urlsplit
 from hermes_dir_acl import make_user_dir, unusable_dir_remedy
+from gateway.platforms.base_log_safety import safe_url_for_log  # re-exported: adapters import it from here
 
 from utils import normalize_proxy_url
 from agent.i18n import t
@@ -461,27 +461,6 @@ def unauthorized_action_notice(platform: Any) -> str:
     Call it per refusal — never bind the result at import, or the language freezes."""
     name = getattr(platform, "value", platform)
     return t("gateway.unauthorized.action_notice", platform=str(name or "<platform>"))
-
-
-def safe_url_for_log(url: str, max_len: int = 80) -> str:
-    """Return a URL string safe for logs (no query/fragment/userinfo)."""
-    raw = str(url) if max_len > 0 and url is not None else ""
-    if not raw:
-        return ""
-    try:
-        parsed = urlsplit(raw)
-    except Exception:
-        return raw[:max_len]
-    safe = raw
-    if parsed.scheme and parsed.netloc:
-        # Strip potential embedded credentials (user:pass@host).
-        path = parsed.path or ""
-        basename = path.rsplit("/", 1)[-1]
-        tail = "" if path in ("", "/") else f"/.../{basename}" if basename else "/..."
-        safe = f"{parsed.scheme}://{parsed.netloc.rsplit('@', 1)[-1]}{tail}"
-    if len(safe) <= max_len:
-        return safe
-    return "." * max_len if max_len <= 3 else f"{safe[:max_len - 3]}..."
 
 
 async def _ssrf_redirect_guard(response):

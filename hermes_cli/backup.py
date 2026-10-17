@@ -16,7 +16,6 @@ from contextlib import contextmanager, suppress
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from hermes_dir_acl import make_user_dir
 
 from hermes_constants import (
     LOCAL_RUNTIME_ROOT_DIRS, _get_platform_default_hermes_home, get_default_hermes_root, get_hermes_home,
@@ -1306,10 +1305,10 @@ def _create_quick_snapshot_locked(
     snap_dir = root / snap_id
     staging_dir = root / f".{snap_id}.{os.getpid()}.partial"
     shutil.rmtree(staging_dir, ignore_errors=True)
-    make_user_dir(root, parents=True, exist_ok=True, mode=0o700)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
     if os.name != "nt":
         os.chmod(root, 0o700)
-    make_user_dir(staging_dir, mode=0o700, exist_ok=False)
+    staging_dir.mkdir(mode=0o700, exist_ok=False)
     logger.info("quick snapshot phase=copy status=started id=%s", snap_id)
 
     manifest: dict[str, int] = {}  # rel_path -> file size
