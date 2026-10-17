@@ -300,3 +300,60 @@ async def test_concurrent_settlers_run_the_close_lifecycle_once(tmp_path, monkey
 
     assert [name for name, _ in calls] == ['commit', 'finalize']
     assert db.get_session('chat')['end_reason'] == 'cli_close'
+
+
+async def _restarted_owner(tmp_path, monkeypatch, db):
+    """The next gateway process on the same state.db: a new authority whose memory starts empty."""
+    db2, authority, calls = await _owner(tmp_path, monkeypatch)
+    assert authority.pending_closes == {}
+    return db2, authority, calls
+
+
+@pytest.mark.asyncio
+async def test_a_close_pending_at_gateway_stop_completes_after_restart(tmp_path, monkeypatch):
+    """#134889 LC-6b, independent review P2-4: Ctrl+D mid-turn, then the gateway stops before the
+    turn's idle point. The deferred close lived only in memory, so the row stayed open forever."""
+    from gateway.session_local_recovery import recover_local_sessions
+    from hermes_state_runtime import admit_session_input, cancel_session_input
+
+    db, authority, _calls = await _owner(tmp_path, monkeypatch)
+    viewer, subscription = await _open(db, authority, tmp_path)
+    row = admit_session_input(db, epoch=authority.epoch, principal_id='native', session_id='chat',
+                              request_id='r1', payload={'text': 'mid-turn'})
+    await _call(viewer, 'session.detach', session_id='chat', subscription_id=subscription, end_reason='cli_close')
+    assert db.get_session('chat')['ended_at'] is None and 'chat' in authority.pending_closes
+    # The shutdown settles the turn (interrupted) without reaching the drain's idle point.
+    cancel_session_input(db, epoch=authority.epoch, admission_id=row['admission_id'])
+
+    db2, restarted, calls2 = await _restarted_owner(tmp_path, monkeypatch, db)
+    recover_local_sessions(restarted, schedule=True)
+    await async_wait_until(lambda: len(calls2) == 2, timeout=10)
+    assert db2.get_session('chat')['end_reason'] == 'cli_close'
+    assert [name for name, _ in calls2] == ['commit', 'finalize']
+    assert db2.get_meta('gateway.viewer_close.v1:chat') is None  # settled: nothing left to re-arm
+
+
+@pytest.mark.asyncio
+async def test_a_viewer_reattaching_cancels_the_persisted_close(tmp_path, monkeypatch):
+    from gateway.session_local_recovery import recover_local_sessions
+    from gateway.session_viewer_close import CLOSE_PREFIX
+    from hermes_state_runtime import admit_session_input, cancel_session_input
+
+    db, authority, _calls = await _owner(tmp_path, monkeypatch)
+    viewer, subscription = await _open(db, authority, tmp_path)
+    row = admit_session_input(db, epoch=authority.epoch, principal_id='native', session_id='chat',
+                              request_id='r1', payload={'text': 'mid-turn'})
+    await _call(viewer, 'session.detach', session_id='chat', subscription_id=subscription, end_reason='cli_close')
+    assert db.get_meta(CLOSE_PREFIX + 'chat') == 'cli_close'
+
+    # Re-attach before settlement (same process): the stored close goes with the in-memory one.
+    await _call(_viewer(authority, tmp_path), 'session.resume', session_id='chat')
+    assert authority.pending_closes == {} and db.get_meta(CLOSE_PREFIX + 'chat') is None
+
+    # And after a restart (the turn settled meanwhile) nothing re-arms it.
+    cancel_session_input(db, epoch=authority.epoch, admission_id=row['admission_id'])
+    db2, restarted, calls2 = await _restarted_owner(tmp_path, monkeypatch, db)
+    recover_local_sessions(restarted, schedule=True)
+    assert restarted.sessions['chat'].task is None  # no queued turn and no close: no drain at all
+    assert restarted.pending_closes == {} and calls2 == []
+    assert db2.get_session('chat')['ended_at'] is None

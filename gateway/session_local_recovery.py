@@ -176,3 +176,8 @@ def recover_local_sessions(authority, *, schedule=False):
                 authority._schedule(ref)
         except RuntimeStoreError as exc:
             logging.getLogger(__name__).warning('Local session %s paused: %s', sid, exc.reason)
+    if schedule:
+        # A last-viewer close the previous owner stopped before completing (#134889 LC-6b).
+        from gateway.session_viewer_close import rearm_persisted_closes
+        for sid in rearm_persisted_closes(authority):
+            authority._schedule(SessionRef(authority.profile_id, sid))

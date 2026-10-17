@@ -276,6 +276,9 @@ class SessionAuthority:
             snapshot = SubscriptionSnapshot(subscription, handle, epoch,
                                         sequence, tuple(local_history(self, ref)),
                                         tuple(self._pending_receipt(r) for r in self._pending_rows(ref)), prompts)
+        from gateway.session_viewer_close import CLOSE_PREFIX, forget_persisted_close
+        if await asyncio.to_thread(self.db.get_meta, CLOSE_PREFIX + ref.session_id) is not None:
+            await asyncio.to_thread(forget_persisted_close, self, ref.session_id)  # the viewer cancels it
         from gateway.session_deferred_pick import reask_on_attach
         await reask_on_attach(self, ref, live)
         return snapshot

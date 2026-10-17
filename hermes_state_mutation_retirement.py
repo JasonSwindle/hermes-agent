@@ -200,6 +200,7 @@ def retire_routes(conn, session_ids):
         conn.execute('INSERT OR REPLACE INTO state_meta(key,value) VALUES(?,?)',
                      (RETIRED_PREFIX + sid, json.dumps({'retired_at': time.time()})))
         conn.execute('DELETE FROM state_meta WHERE key=?', ('gateway.api.settings.v1.' + sid,))
+        conn.execute('DELETE FROM state_meta WHERE key=?', ('gateway.viewer_close.v1:' + sid,))
     targets = set(session_ids)
     for row in conn.execute('SELECT scope,session_key,entry_json FROM gateway_routing').fetchall():
         if entry_session_id(row['entry_json']) in targets:
