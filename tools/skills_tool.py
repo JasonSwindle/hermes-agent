@@ -51,15 +51,19 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
     sig = []
     for d in dirs_to_scan:
         try:
-            m = d.stat().st_mtime
+            m = d.stat().st_mtime_ns
         except OSError:
             continue
+        names = []
         with suppress(OSError), os.scandir(d) as it:
             for entry in it:
                 with suppress(OSError):
                     if entry.is_dir(follow_symlinks=False):
-                        m = max(m, entry.stat(follow_symlinks=False).st_mtime)
-        sig.append((str(d), m))
+                        m = max(m, entry.stat(follow_symlinks=False).st_mtime_ns)
+                        names.append(entry.name)
+        # The child names, not only mtimes: an install and an uninstall inside one coarse mtime tick
+        # (1-2 s on some filesystems) leave every mtime equal, and the change must still show.
+        sig.append((str(d), m, tuple(sorted(names))))
     return (tuple(sig), frozenset(disabled), platform)
 
 
