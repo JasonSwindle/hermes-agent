@@ -1,8 +1,12 @@
-"""Explicit offline repair of additive state.db schema drift.
+"""Additive state.db schema drift: detection, the one-shot browse reconcile, and explicit repair.
 
-Browsing stays read-only. Reconcile a protected snapshot so failed DDL never
-leaves the user's store partly upgraded or escalates into FTS surgery.
+Drift (a declared table/column missing) is not corruption. Browsing catches an unowned store up
+once, additive DDL only (:func:`reconcile_drift_for_browse`); ``hermes sessions repair`` reconciles
+a protected snapshot so failed DDL never leaves the store partly upgraded or escalates into FTS
+surgery (:func:`repair_declarative_schema`). Neither runs while a gateway owns the store.
 """
+import contextlib
+import logging
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -91,6 +95,107 @@ def _reconcile_locked(path, backup, report):
             raise RuntimeError(f'could not acquire exclusive state.db repair ownership: {error}')
         _reconcile_snapshot(path, guard)
         report.update(repaired=True, strategy='reconcile_declarative_schema')
+
+
+# Browse-time reconcile (#140315). A store whose tables/columns lag SCHEMA_SQL is not corrupt:
+# a writable open would catch it up, but an idle profile with no gateway never gets one, so every
+# read-only surface (sidebar, /api/sessions/<id>/messages?profile=) lost its whole history.
+# Catch it up ONCE, additive DDL only, in one short transaction, and only while holding that
+# profile's gateway runtime lock. When a gateway owns the store it is the only writer: refuse
+# by name with the remedy instead of becoming a second one.
+_BROWSE_RECONCILE_BUSY_S = 2.0
+
+
+class DeclarativeDriftError(RuntimeError):
+    """The store lags SCHEMA_SQL (missing table/column) and browsing could not catch it up."""
+
+    def __init__(self, detail: str, *, owned: bool = False):
+        super().__init__(detail)
+        self.owned = owned
+
+
+def is_declarative_drift_error(exc: BaseException) -> bool:
+    """``no such table/column`` from a schema read probe: drift, never corruption."""
+    from hermes_state_repair import _schema_not_built
+    return isinstance(exc, sqlite3.OperationalError) and _schema_not_built(exc)
+
+
+def _owner_remedy(home: Path) -> tuple[str, str]:
+    from gateway.status import _profile_label_for_home  # never raises: None when unknown
+    label = _profile_label_for_home(home)
+    if label and label != 'default':
+        return label, f'hermes -p {label} gateway restart'
+    return label or str(home), 'hermes gateway restart'
+
+
+def _apply_additive_schema(path: Path) -> None:
+    """Missing SCHEMA_SQL tables and columns, in ONE ``BEGIN IMMEDIATE`` transaction.
+
+    No data migration, no FTS work, no schema_version stamp (that stays the owner's: the
+    version gates data migrations this path does not run). Every statement is additive and
+    idempotent, so a failure rolls the store back to exactly what it was."""
+    from hermes_cli.sqlite_safe_read import connect_tracked
+    from hermes_state_common import SCHEMA_SQL
+    from hermes_state_repair import _reapply_durability_barriers
+    from hermes_state_schema import SessionSchemaMixin
+
+    with closing(connect_tracked(path, tracking_path=path, timeout=_BROWSE_RECONCILE_BUSY_S,
+                                 isolation_level=None)) as conn:
+        _reapply_durability_barriers(conn)
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            cursor = conn.cursor()
+            shim = object.__new__(SessionSchemaMixin)
+            # Columns first: SCHEMA_SQL indexes may name columns an old table lacks.
+            shim._reconcile_columns(cursor)
+            SessionSchemaMixin._execute_ddl_script_transactional(cursor, SCHEMA_SQL)
+            shim._reconcile_columns(cursor)  # tables the script just created are complete; no-op
+            conn.execute('COMMIT')
+        except BaseException:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute('ROLLBACK')
+            raise
+
+
+def reconcile_drift_for_browse(path: Path) -> bool:
+    """Catch a lagging store up for a read-only browse; True when DDL ran, False when already current.
+
+    Raises :class:`DeclarativeDriftError` (``owned=True`` when a running gateway owns the store)
+    with a user-facing detail naming the drift and the remedy. Never touches a store missing its
+    history tables: recreating them empty would hide lost sessions."""
+    from gateway.runtime_ownership import OwnershipConflict, exclusive_maintenance
+
+    reason = schema_drift_reason(path)
+    if reason is None:
+        return False
+    from hermes_cli.sqlite_safe_read import connect_tracked
+    with closing(connect_tracked(path.resolve().as_uri() + '?mode=ro', uri=True, tracking_path=path)) as conn:
+        try:
+            _require_history_tables(conn)
+        except RuntimeError as exc:
+            raise DeclarativeDriftError(
+                f'Session store is missing its history tables ({reason}); this is not upgrade drift. '
+                'Run `hermes sessions recover`.') from exc
+    label, remedy = _owner_remedy(path.parent)
+    try:
+        with exclusive_maintenance([path.parent]):
+            # Re-check under the lock: a gateway that started and released between probes
+            # (or a sibling browse) may already have caught the store up.
+            if schema_drift_reason(path) is None:
+                return False
+            _apply_additive_schema(path)
+    except OwnershipConflict as exc:
+        raise DeclarativeDriftError(
+            f"Session store for profile '{label}' is behind this Hermes version ({reason}), and a "
+            f'running gateway owns it, so browsing will not write to it. Restart that gateway '
+            f'(`{remedy}`) to bring the store up to date.', owned=True) from exc
+    if after := schema_drift_reason(path):
+        raise DeclarativeDriftError(
+            f"Session store for profile '{label}' is behind this Hermes version and could not be "
+            f'caught up ({after}). Run `hermes sessions repair` for that profile.')
+    logging.getLogger(__name__).warning(
+        'state.db at %s lagged SCHEMA_SQL (%s); added the missing tables/columns for browsing', path, reason)
+    return True
 
 
 def repair_declarative_schema(path: Path, *, backup: bool = True):

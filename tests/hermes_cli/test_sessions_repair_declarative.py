@@ -9,7 +9,13 @@ from hermes_state import SessionDB
 from hermes_state_common import SCHEMA_VERSION
 from hermes_cli import sessions_cmd
 from hermes_cli.web_server_sessions import _open_session_db_at_path
-from fastapi import HTTPException
+
+
+@pytest.fixture(autouse=True)
+def _volume_headroom(monkeypatch):
+    """The backup/snapshot guards reserve 2% of the volume: hermetic on a nearly full dev disk."""
+    import hermes_state_repair as repair
+    monkeypatch.setattr(repair, '_REPAIR_BACKUP_FREE_FRACTION', 0.0)
 
 
 def _legacy_store(tmp_path, monkeypatch):
@@ -33,9 +39,7 @@ def _legacy_store(tmp_path, monkeypatch):
 def test_check_only_reports_drift_without_mutation(tmp_path, monkeypatch):
     path = _legacy_store(tmp_path, monkeypatch)
     before = path.read_bytes()
-    with pytest.raises(HTTPException) as exc:
-        _open_session_db_at_path(path, read_only=True)
-    assert exc.value.status_code == 503
+    # Browsing would catch this unowned store up (#140315); check-only must not.
     assert sessions_cmd._cmd_repair(SimpleNamespace(check_only=True)) == 1
     assert path.read_bytes() == before
 

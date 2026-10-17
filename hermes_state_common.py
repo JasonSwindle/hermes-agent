@@ -281,7 +281,12 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})")
 
 
-SCHEMA_VERSION = 31
+# v32 (#140315): no data migration. #106742 added runtime_epoch, session_admissions, worker_executions,
+# worker_receipts and three columns to SCHEMA_SQL while v31 stayed, so a store missing them read as
+# current. The bump makes that store detectably behind; its catch-up is the declarative
+# executescript(SCHEMA_SQL) + _reconcile_columns() every writable open already runs (additive,
+# idempotent). Bump again whenever SCHEMA_SQL gains a table or column.
+SCHEMA_VERSION = 32
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA

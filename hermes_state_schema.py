@@ -762,6 +762,8 @@ class SessionSchemaMixin:
                 rows = cursor.execute(f'PRAGMA table_info("{table_name}")').fetchall()
             except sqlite3.OperationalError:
                 continue  # Table doesn't exist yet (shouldn't happen after executescript)
+            if not rows:
+                continue  # PRAGMA table_info returns [] for a missing table; the DDL creates it whole
             # PRAGMA table_info rows: (cid, name, type, notnull, dflt_value, pk)
             live_cols = {row[1] for row in rows}
             for col_name, col_type in declared_cols.items():
@@ -1104,6 +1106,9 @@ class SessionSchemaMixin:
             ).fetchone() is None:
                 self.set_meta("fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor)
 
+        # v32: nothing to run here. The declared tables/columns #106742 added under v31 were already
+        # created by _init_schema's executescript(SCHEMA_SQL) + _reconcile_columns() before this chain;
+        # the version only records that the store has them (#140315).
         # Advance schema_version — deliberately NOT gated on the FTS opt-in (that would block
         # every future migration for a user who never optimizes). FTS5 unavailable is the
         # one skip: claiming current would lie.
