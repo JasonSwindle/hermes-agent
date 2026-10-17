@@ -38,6 +38,22 @@ def test_elevated_grants_every_created_dir_and_an_existing_leaf_once(tmp_path, m
     assert granted[-1] == existing  # the repair case: re-grant an existing leaf
 
 
+def test_elevated_existing_leaf_without_exist_ok_is_repaired_then_raises(tmp_path, monkeypatch):
+    """Path.mkdir contract stays (FileExistsError), but the left-behind dir is granted first."""
+    granted = []
+    monkeypatch.setattr(hermes_dir_acl.sys, "platform", "win32")
+    monkeypatch.setattr(hermes_dir_acl, "process_is_elevated", lambda: True)
+    monkeypatch.setattr(hermes_dir_acl, "grant_user_access", lambda p: granted.append(p) or True)
+    monkeypatch.setattr(hermes_dir_acl, "_granted", set())
+    left = tmp_path / "state"
+    left.mkdir()
+    with pytest.raises(FileExistsError):
+        hermes_dir_acl.make_user_dir(left)
+    assert granted == [left]
+    hermes_dir_acl.make_user_dir(left, parents=True, exist_ok=True)
+    assert granted == [left]  # memoized: no second ACE
+
+
 def test_a_failed_grant_never_fails_the_mkdir_and_is_retried(tmp_path, monkeypatch):
     monkeypatch.setattr(hermes_dir_acl.sys, "platform", "win32")
     monkeypatch.setattr(hermes_dir_acl, "process_is_elevated", lambda: True)

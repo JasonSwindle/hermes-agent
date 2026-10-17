@@ -315,7 +315,8 @@ def make_user_dir(path: str | Path, mode: int = 0o777, *, parents: bool = False,
     Off Windows or unelevated this is ``Path.mkdir`` and nothing else. Elevated, every directory
     this call created (missing parents included) and the leaf, even when it already existed (the
     repair case), get the user's inheriting full-control ACE once per process, except that a
-    component that is a junction/symlink/reparse point stops the grants with one warning."""
+    component that is a junction/symlink/reparse point stops the grants with one warning. An
+    existing leaf without ``exist_ok`` is still granted before the ``FileExistsError``."""
     target = Path(path)
     if sys.platform != "win32" or not process_is_elevated():
         target.mkdir(mode=mode, parents=parents, exist_ok=exist_ok)
@@ -325,18 +326,29 @@ def make_user_dir(path: str | Path, mode: int = 0o777, *, parents: bool = False,
     while not probe.exists() and probe.parent != probe:
         created.append(probe)
         probe = probe.parent
-    target.mkdir(mode=mode, parents=parents, exist_ok=exist_ok)
-    to_grant = list(reversed(created or [target]))
+    try:
+        target.mkdir(mode=mode, parents=parents, exist_ok=exist_ok)
+    except FileExistsError:
+        # ``Path.mkdir`` contract: an existing leaf still raises without exist_ok. The directory an
+        # earlier elevated run left is repaired first, so the caller's error is never the reason a
+        # non-elevated Hermes stays locked out of it.
+        if target.is_dir() and not is_reparse_point(target):
+            _grant_dirs(target, [target])
+        raise
+    _grant_dirs(target, list(reversed(created or [target])))
+    return target
+
+
+def _grant_dirs(target: Path, to_grant: list[Path]) -> None:
     # A junction/symlink planted at (or swapped in for) the leaf, a created component, or any
     # existing ancestor inside the home: grant nothing, one warning (nothing past it is in the home).
     for component in dict.fromkeys([*_components_below_home(target), *to_grant]):
         if is_reparse_point(component):
             _warn_refused(component, ReparsePointRefused("junction, symlink or other reparse point"))
-            return target
+            return
     for directory in to_grant:
         if directory not in _granted and grant_user_access(directory):
             _granted.add(directory)
-    return target
 
 
 def unusable_dir_remedy(path: str | Path) -> str:

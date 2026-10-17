@@ -142,8 +142,8 @@ def test_elevated_rerun_repairs_a_dir_an_earlier_elevated_run_left(reporters_par
     left = reporters_parent / "state"
     left.mkdir()
     before = _child("print(json.dumps({'usable': usable(sys.argv[1])}))", str(left))
-    make_user_dir(left)
-    make_user_dir(left)  # idempotent: no second ACE
+    make_user_dir(left, parents=True, exist_ok=True)  # how every production caller re-enters
+    make_user_dir(left, parents=True, exist_ok=True)  # idempotent: no second ACE
     after = _child("print(json.dumps({'usable': usable(sys.argv[1])}))", str(left))
     acl = subprocess.run(["icacls", str(left)], capture_output=True, text=True, check=True).stdout
     assert before["usable"] is False and after["usable"] is True, acl
