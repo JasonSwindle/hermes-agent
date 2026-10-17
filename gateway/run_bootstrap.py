@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -544,12 +545,38 @@ def _start_gateway_resolve_terminal_cwd() -> None:
             os.environ["TERMINAL_CWD"] = resolved_cwd
 
 
+# A browse that catches a lagging state.db up holds the profile's gateway.lock for at most its
+# sqlite busy budget (hermes_state_reconcile._BROWSE_RECONCILE_BUSY_S, 2 s). A gateway booting in
+# that window waits it out instead of exiting as if another gateway owned the profile.
+_BROWSE_RECONCILE_RESERVE_WAIT_S = 5.0
+
+
+def _reserve_waiting_out_browse_reconcile(ownership, homes, *, wait_s: float = _BROWSE_RECONCILE_RESERVE_WAIT_S):
+    from gateway.runtime_ownership import OwnershipConflict, maintenance_holder
+    from hermes_state_reconcile import BROWSE_RECONCILE_PURPOSE
+    deadline = time.monotonic() + wait_s
+    logged = False
+    while True:
+        try:
+            return ownership.reserve(homes)
+        except OwnershipConflict:
+            holders = [h for h in homes if maintenance_holder(h, BROWSE_RECONCILE_PURPOSE)]
+            if not holders or time.monotonic() >= deadline:
+                raise
+            if not logged:
+                logger.info("Profile %s is held by a short session-store schema catch-up; waiting up to %.0fs",
+                            holders[0], wait_s)
+                logged = True
+            time.sleep(0.1)
+
+
 def _start_gateway_reserve_profiles(profile_homes) -> bool:
     """Reserve the launch home plus every served profile home; False when startup must abort."""
     from gateway.run import get_hermes_home
     from gateway.runtime_ownership import process_ownership, OwnershipConflict
+    homes = [get_hermes_home(), *(home for _, home in profile_homes)]
     try:
-        process_ownership.reserve([get_hermes_home(), *(home for _, home in profile_homes)])
+        _reserve_waiting_out_browse_reconcile(process_ownership, homes)
     except OwnershipConflict as exc:
         logger.error("Cannot reserve gateway profiles: %s", exc)
         # A named profile that the LIVE default multiplexer already serves is a configuration

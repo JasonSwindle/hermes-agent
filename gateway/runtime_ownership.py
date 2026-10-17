@@ -216,6 +216,17 @@ process_ownership = ProfileOwnership()
 _maintenance = threading.local()
 
 
+def maintenance_holder(home: Path, purpose: str) -> dict | None:
+    """The live holder record of *home*'s ``gateway.lock`` when it is a ``purpose`` maintenance
+    reservation (see :meth:`ProfileOwnership.reserve`), else None. Advisory only: it names the
+    holder for a refusal or a short wait, it never grants the lock."""
+    from gateway.status import _live_pid_from_record, _read_gateway_lock_record
+    record = _read_gateway_lock_record(canonical_home(home) / 'gateway.lock')
+    if not record or record.get('purpose') != purpose or _live_pid_from_record(record) is None:
+        return None
+    return record
+
+
 def live_runtime_owner(home: Path) -> int | None:
     """PID of a live runtime owner of *home* (a gateway, or a reservation that is not marked as
     maintenance), else None. A purpose-marked maintenance holder is never an owner."""

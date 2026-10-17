@@ -410,3 +410,39 @@ def test_stuck_maintenance_holder_gets_busy_retry_not_a_gateway_remedy(tmp_path)
     assert "Retry" in detail
     assert "gateway" not in detail.lower()
     assert _file_state(path) == before
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_gateway_boot_reserve_waits_out_a_browse_reconcile(tmp_path):
+    """P3-1: a gateway booting while a browse reconcile holds gateway.lock waits for it (bounded)
+    instead of exiting as though another gateway owned the profile. A real owner still refuses."""
+    import time
+
+    from gateway.run_bootstrap import _reserve_waiting_out_browse_reconcile
+    from gateway.runtime_ownership import OwnershipConflict, ProfileOwnership
+    from hermes_state_reconcile import BROWSE_RECONCILE_PURPOSE
+
+    home = _profile_home(tmp_path)
+    holder = _hold(home, 1.0, BROWSE_RECONCILE_PURPOSE)
+    booting = ProfileOwnership()
+    try:
+        started = time.monotonic()
+        _reserve_waiting_out_browse_reconcile(booting, [home], wait_s=10)
+        assert booting.owns(home)
+        assert time.monotonic() - started < 9
+    finally:
+        booting.close()
+        holder.kill()
+        holder.wait()
+
+    gateway = _hold(home, 30)  # an unmarked holder is a runtime owner: refuse at once
+    contender = ProfileOwnership()
+    try:
+        started = time.monotonic()
+        with pytest.raises(OwnershipConflict):
+            _reserve_waiting_out_browse_reconcile(contender, [home], wait_s=10)
+        assert time.monotonic() - started < 2
+    finally:
+        contender.close()
+        gateway.kill()
+        gateway.wait()
