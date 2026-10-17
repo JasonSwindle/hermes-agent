@@ -57,7 +57,7 @@ class RecoveredSecrets(dict):
     session = None
 
 
-def policy_identity(policy):
+def policy_identity(policy, unhashed=()):
     data = asdict(policy)
     data.pop('credential_ref')
     data.pop('config_secret_ref')
@@ -71,7 +71,25 @@ def policy_identity(policy):
             data.pop(name, None)
     if not data.get('client_env_remote'):
         data.pop('client_env_remote', None)
+    for name in unhashed:  # _legacy_identities: a field the stamping gateway did not have yet
+        data.pop(name, None)
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+
+# Policy fields a release added after frozen config secrets shipped, hashed unconditionally by the
+# gateway that added them. A reference an older gateway stamped never hashed them; at their defaults
+# they carry nothing that gateway could have seen, so the same policy without them is its policy.
+_LATER_POLICY_FIELDS = (('skills_prompt', None), ('kanban_json', None), ('safe_mode', False),
+                        ('ignore_user_config', False))
+
+
+def _legacy_identities(policy):
+    """Every whole-policy hash a gateway older than ``bound`` could have stamped for *policy*: the
+    current hash, plus each subset of the later fields dropped while they are at their defaults."""
+    from itertools import combinations
+    unset = [name for name, default in _LATER_POLICY_FIELDS if getattr(policy, name) == default]
+    return {policy_identity(policy, dropped)
+            for size in range(len(unset) + 1) for dropped in combinations(unset, size)}
 
 
 def _fingerprint(value):
@@ -79,15 +97,39 @@ def _fingerprint(value):
 
 
 # What a frozen secret authenticates: the endpoint fields of the block that holds it (``model:``, a
-# ``providers:`` entry, an MCP server). A secret is bound to these, never to the rest of the policy.
-_ENDPOINT_KEYS = ('provider', 'base_url', 'url', 'command', 'args', 'api_mode')
+# ``providers:`` entry, an MCP server), plus the endpoint its route RESOLVES to when that lives in another
+# block. A secret is bound to these, never to the rest of the policy. ``api`` is an entry's URL field
+# (runtime_provider_custom._entry_url reads it before ``url``/``base_url``).
+_ENDPOINT_KEYS = ('provider', 'base_url', 'api', 'url', 'command', 'args', 'api_mode')
+_ROUTE_SECTIONS = ('model', 'fallback_model', 'fallback_providers')
+_ENTRY_SECTIONS = ('providers', 'custom_providers')
+
+
+def _owner_block(config, path):
+    """The config path of the block whose endpoint the secret at *path* authenticates: a route block
+    (``model``, a fallback entry) or a provider entry as a whole, else the secret's own parent block."""
+    if path[0] in _ENTRY_SECTIONS or path[0] == 'fallback_providers':
+        return tuple(path[:2])
+    if path[0] == 'fallback_model' and isinstance(config.get('fallback_model'), list):
+        return tuple(path[:2])
+    if path[0] in _ROUTE_SECTIONS:
+        return tuple(path[:1])
+    return tuple(path[:-1])
 
 
 def _binding(config, path):
     """Digest of the endpoint the secret at *path* authenticates in the frozen *config* (a terminal-scope
     secret, ``path[0] is None``, authenticates no endpoint)."""
-    block = _defined(config, path[:-1]) if path and path[0] is not None else _ABSENT
+    owner = _owner_block(config, path) if path and path[0] is not None else None
+    block = _defined(config, owner) if owner else _ABSENT
     endpoint = {k: block[k] for k in _ENDPOINT_KEYS if k in block} if isinstance(block, dict) else {}
+    if isinstance(block, dict) and path[0] in _ROUTE_SECTIONS:
+        # A route's key authenticates what it resolves to: a named ``providers:`` entry's URL included.
+        from gateway.session_route_identity import resolved_route
+        endpoint['resolved'] = list(resolved_route(block, config))
+    elif isinstance(block, dict) and path[0] in _ENTRY_SECTIONS:
+        from hermes_cli.runtime_provider_custom import _entry_url
+        endpoint['resolved'] = str(_entry_url(block) or '')
     return hashlib.sha256(json.dumps([list(path), endpoint], sort_keys=True).encode()).hexdigest()
 
 
@@ -116,12 +158,12 @@ def _check_scope(authority, source, policy, home, skip):
             raise RuntimeStoreError('launch_credentials_unavailable', field=name,
                                     detail=f'the frozen config credentials belong to another {name}')
     if 'bound' not in source:
-        # Stamped before ``bound``: its whole-policy hash also covers fields an older gateway did not
-        # know and settings no secret depends on, so a mismatch alone proves no credential change. The
-        # per-entry fingerprints below still gate every value; the next re-bind writes ``bound``.
-        if source['policy'] != policy_identity(policy):
-            logger.warning('Session %s: frozen config reference predates scoped credential binding; '
-                           'verifying its entries by fingerprint', source.get('session'))
+        # Stamped before ``bound``: its whole-policy hash is its only endpoint guard, so it must still
+        # match -- allowing for the policy fields added since, at their defaults (_legacy_identities).
+        # The next re-bind writes ``bound``.
+        if source['policy'] not in _legacy_identities(policy):
+            raise RuntimeStoreError('launch_credentials_unavailable', field='config_secret_ref',
+                                    detail='stamped by an older gateway for another session policy')
         return
     config = json.loads(policy.config_json)
     for path, digest in source['bound']:

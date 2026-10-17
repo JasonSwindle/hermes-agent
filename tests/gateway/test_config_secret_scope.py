@@ -219,3 +219,82 @@ def test_a_secret_paired_with_a_moved_endpoint_is_refused_by_name(tmp_path, monk
     with pytest.raises(RuntimeStoreError, match='launch_credentials_unavailable') as refused:
         replace(policy, config_json=json.dumps(config)).config(owner())
     assert refused.value.field == field and 'endpoint' in refused.value.detail
+
+
+def _bind(tmp_path, monkeypatch, cfg):
+    from gateway.session_policy import bind_launch_key, build_policy
+    home = tmp_path / 'profile'
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    (home / 'config.yaml').write_text(json.dumps(cfg))
+
+    def owner():
+        return SimpleNamespace(db=SimpleNamespace(db_path=home / 'state.db'), profile_id='owned',
+                               instance_id='new', epoch=2)
+    private = {}
+    policy = build_policy({'cwd': str(home), 'model': 'frozen'}, cfg, private_secrets=private)
+    return owner, bind_launch_key(owner(), 'session', policy, None, config_secrets=private)
+
+
+def _repointed(policy, mutate):
+    config = json.loads(policy.config_json)
+    mutate(config)
+    return replace(policy, config_json=json.dumps(config))
+
+
+# Each secret authenticates the endpoint its route RESOLVES to, which can live in another block: a keyless
+# ``providers:`` entry the ``model:`` route names, a fallback's provider entry, an entry's ``api`` URL.
+_ROUTED = {
+    'entry_api_url': ({'model': {'provider': 'p2', 'default': 'm'},
+                       'providers': {'p2': {'api': 'http://good.invalid/v1', 'api_key': 'K-p2'}}},
+                      lambda c: c['providers']['p2'].__setitem__('api', 'http://evil.invalid/v1'),
+                      'providers.p2.api_key'),
+    'model_key_keyless_entry': ({'model': {'provider': 'myprov', 'default': 'm', 'api_key': 'K-model'},
+                                 'providers': {'myprov': {'base_url': 'http://good.invalid/v1'}}},
+                                lambda c: c['providers']['myprov'].__setitem__('base_url', 'http://evil.invalid/v1'),
+                                'model.api_key'),
+    'fallback_key_via_entry': ({'model': {'provider': 'custom', 'default': 'm', 'base_url': 'http://good.invalid/v1'},
+                                'providers': {'fb': {'base_url': 'http://good-fb.invalid/v1'}},
+                                'fallback_providers': [{'provider': 'fb', 'model': 'x', 'api_key': 'K-fb'}]},
+                               lambda c: c['providers']['fb'].__setitem__('base_url', 'http://evil.invalid/v1'),
+                               'fallback_providers.0.api_key'),
+}
+
+
+@pytest.mark.parametrize('case', sorted(_ROUTED))
+def test_a_secret_is_bound_to_the_endpoint_its_route_resolves_to(tmp_path, monkeypatch, case):
+    """Independent review P2-2: moving the URL the secret actually authenticates, even when it lives in
+    another block or under ``api``, refuses the secret by name instead of pairing it with the new URL."""
+    from hermes_state_runtime import RuntimeStoreError
+    cfg, mutate, field = _ROUTED[case]
+    owner, policy = _bind(tmp_path, monkeypatch, cfg)
+    assert policy.config(owner())  # the unmoved policy recovers
+    with pytest.raises(RuntimeStoreError, match='launch_credentials_unavailable') as refused:
+        _repointed(policy, mutate).config(owner())
+    assert refused.value.field == field and 'endpoint' in refused.value.detail
+
+
+def _legacy(policy):
+    """*policy*'s reference as an older gateway wrote it: no ``bound``, the policy hash over the fields it had."""
+    from gateway.session_policy_credentials import PREFIX
+    source = json.loads(policy.config_secret_ref[len(PREFIX):])
+    data = {k: v for k, v in asdict(policy).items()
+            if k not in ('credential_ref', 'config_secret_ref', *_LATER_FIELDS)}
+    source['policy'] = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+    source.pop('bound', None)
+    return replace(policy, config_secret_ref=PREFIX + json.dumps(source, sort_keys=True))
+
+
+def test_a_legacy_reference_keeps_the_endpoint_guard(tmp_path, monkeypatch):
+    """Independent review P2-3: a reference without ``bound`` still matches its own policy (the later
+    fields at their defaults are not hashed), but a moved endpoint, or any other policy rewrite its whole-
+    policy hash covers, is refused instead of degrading to the fingerprints alone."""
+    from hermes_state_runtime import RuntimeStoreError
+    _home_dir, _cfg, owner, policy = _bound_policy(tmp_path, monkeypatch)
+    legacy = _legacy(policy)
+    assert legacy.config(owner())['model']['api_key'] == 'route-token'
+    for moved in (_repointed(legacy, lambda c: c['model'].__setitem__('base_url', 'http://evil.invalid/v1')),
+                  replace(legacy, skills_prompt='set after the stamp')):
+        with pytest.raises(RuntimeStoreError, match='launch_credentials_unavailable') as refused:
+            moved.config(owner())
+        assert refused.value.field == 'config_secret_ref' and refused.value.detail
