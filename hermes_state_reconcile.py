@@ -157,6 +157,10 @@ def _apply_additive_schema(path: Path) -> None:
             raise
 
 
+BROWSE_RECONCILE_PURPOSE = 'browse_schema_reconcile'
+_BROWSE_SIBLING_POLL_S = 0.1
+
+
 class CorruptStoreError(sqlite3.DatabaseError):
     """The lagging store is also damaged: browsing must not write DDL into it. Worded like sqlite's
     own malformed-image error so every caller maps it to the corrupt-store status (``hermes doctor``)."""
@@ -180,6 +184,20 @@ def _quick_check_problem(path: Path):
     return '; '.join(problems[:3]) or None
 
 
+def _wait_for_sibling_reconcile(path: Path, home: Path):
+    """A sibling browse (another thread or process) holds the lock for its own reconcile: wait at
+    most the busy budget for it. None once the store is current, else the remaining drift."""
+    import time
+    from gateway.runtime_ownership import live_runtime_owner
+    deadline = time.monotonic() + _BROWSE_RECONCILE_BUSY_S
+    while True:
+        if (reason := schema_drift_reason(path)) is None:
+            return None
+        if time.monotonic() >= deadline or live_runtime_owner(home) is not None:
+            return reason
+        time.sleep(_BROWSE_SIBLING_POLL_S)
+
+
 def reconcile_drift_for_browse(path: Path) -> bool:
     """Catch a lagging store up for a read-only browse; True when DDL ran, False when already current.
 
@@ -187,7 +205,7 @@ def reconcile_drift_for_browse(path: Path) -> bool:
     with a user-facing detail naming the drift and the remedy, and :class:`CorruptStoreError`
     when the lagging store is also damaged. Never touches a store missing its history tables:
     recreating them empty would hide lost sessions."""
-    from gateway.runtime_ownership import OwnershipConflict, exclusive_maintenance
+    from gateway.runtime_ownership import OwnershipConflict, exclusive_maintenance, live_runtime_owner
 
     reason = schema_drift_reason(path)
     if reason is None:
@@ -200,9 +218,16 @@ def reconcile_drift_for_browse(path: Path) -> bool:
             raise DeclarativeDriftError(
                 f'Session store is missing its history tables ({reason}); this is not upgrade drift. '
                 'Run `hermes sessions recover`.') from exc
-    label, remedy = _owner_remedy(path.parent)
+    home = path.parent
+    label, remedy = _owner_remedy(home)
+
+    def owned(drift):
+        return DeclarativeDriftError(
+            f"Session store for profile '{label}' is behind this Hermes version ({drift}), and a "
+            f'running gateway owns it, so browsing will not write to it. Restart that gateway '
+            f'(`{remedy}`) to bring the store up to date.', owned=True)
     try:
-        with exclusive_maintenance([path.parent]):
+        with exclusive_maintenance([home], purpose=BROWSE_RECONCILE_PURPOSE):
             # Re-check under the lock: a gateway that started and released between probes
             # (or a sibling browse) may already have caught the store up.
             if schema_drift_reason(path) is None:
@@ -213,10 +238,16 @@ def reconcile_drift_for_browse(path: Path) -> bool:
                 raise CorruptStoreError(problem)
             _apply_additive_schema(path)
     except OwnershipConflict as exc:
+        if live_runtime_owner(home) is not None:
+            raise owned(reason) from exc
+        # No gateway: the holder is a sibling browse's own reconcile (or other short maintenance).
+        if (pending := _wait_for_sibling_reconcile(path, home)) is None:
+            return False
+        if live_runtime_owner(home) is not None:
+            raise owned(pending) from exc
         raise DeclarativeDriftError(
-            f"Session store for profile '{label}' is behind this Hermes version ({reason}), and a "
-            f'running gateway owns it, so browsing will not write to it. Restart that gateway '
-            f'(`{remedy}`) to bring the store up to date.', owned=True) from exc
+            f"Session store for profile '{label}' is being brought up to date by another Hermes "
+            f'process ({pending}). Retry in a moment; the list was not cleared.') from exc
     if after := schema_drift_reason(path):
         raise DeclarativeDriftError(
             f"Session store for profile '{label}' is behind this Hermes version and could not be "

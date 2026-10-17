@@ -307,3 +307,106 @@ def test_corrupt_non_root_page_plus_drift_is_not_written(tmp_path):
     assert caught.value.detail["error"] == "state_db_corrupt"
     assert _file_state(path) == before
     assert "last_read_at" not in _session_columns(path)
+
+
+def test_concurrent_browses_without_a_gateway_all_succeed(tmp_path):
+    """P2-1: sibling browses of one lagging, unowned store contend for gateway.lock with each
+    other. None may be told a running gateway owns the store; each waits for the sibling."""
+    import threading
+
+    path = _lagging_store_with_history(_profile_home(tmp_path), rows=50)
+    barrier = threading.Barrier(8)
+    results = []
+
+    def browse():
+        barrier.wait()
+        try:
+            _open_session_db_at_path(path, read_only=True).close()
+            results.append("200")
+        except HTTPException as exc:
+            results.append(f"{exc.status_code} {exc.detail}")
+
+    threads = [threading.Thread(target=browse) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results == ["200"] * 8, results
+    assert "last_read_at" in _session_columns(path)
+
+
+_PROC_BROWSE = r'''
+import sys, time
+from pathlib import Path
+from fastapi import HTTPException
+from hermes_cli.web_server_sessions import _open_session_db_at_path
+go = float(sys.argv[2])
+while time.time() < go:
+    time.sleep(0.0005)
+try:
+    _open_session_db_at_path(Path(sys.argv[1]), read_only=True).close()
+    print("RESULT 200")
+except HTTPException as exc:
+    print("RESULT", exc.status_code, exc.detail)
+'''
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_concurrent_browses_from_processes_all_succeed(tmp_path):
+    import os
+    import subprocess
+    import sys
+    import time
+
+    path = _lagging_store_with_history(_profile_home(tmp_path), rows=50)
+    go = time.time() + 2.0
+    procs = [subprocess.Popen([sys.executable, "-c", _PROC_BROWSE, str(path), str(go)], env=os.environ,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) for _ in range(5)]
+    out = [p.communicate(timeout=60)[0] for p in procs]
+    results = [line for o in out for line in o.splitlines() if line.startswith("RESULT")]
+    assert results == ["RESULT 200"] * 5, out
+
+
+_PURPOSE_HOLDER = r'''
+import sys, time
+from pathlib import Path
+from gateway.runtime_ownership import ProfileOwnership
+purpose = sys.argv[3] or None
+owner = ProfileOwnership()
+owner.reserve([Path(sys.argv[1])], purpose=purpose)
+print("held", flush=True)
+time.sleep(float(sys.argv[2]))
+'''
+
+
+def _hold(home, seconds, purpose=""):
+    import os
+    import subprocess
+    import sys
+    proc = subprocess.Popen([sys.executable, "-c", _PURPOSE_HOLDER, str(home), str(seconds), purpose],
+                            env=os.environ, stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "held"
+    return proc
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_stuck_maintenance_holder_gets_busy_retry_not_a_gateway_remedy(tmp_path):
+    """P2-1: when the holder is not a gateway and the store is still behind after the busy budget,
+    the refusal says busy/retry and never tells the user to restart a gateway that is not running."""
+    from hermes_state_reconcile import BROWSE_RECONCILE_PURPOSE
+
+    home = _profile_home(tmp_path)
+    path = _lagging_store_with_history(home, rows=10)
+    holder = _hold(home, 30, BROWSE_RECONCILE_PURPOSE)
+    try:
+        before = _file_state(path)
+        with pytest.raises(HTTPException) as caught:
+            _open_session_db_at_path(path, read_only=True)
+    finally:
+        holder.kill()
+        holder.wait()
+    detail = str(caught.value.detail)
+    assert caught.value.status_code == 503
+    assert "Retry" in detail
+    assert "gateway" not in detail.lower()
+    assert _file_state(path) == before
