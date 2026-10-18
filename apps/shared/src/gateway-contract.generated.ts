@@ -4417,6 +4417,7 @@ export interface AgentPluginRow {
   servers: PluginServerRow[]
   catalog_name?: string | null
   catalog_tier?: string | null
+  catalog_title?: string | null
   installed_sha?: string | null
   catalog_sha?: string | null
   catalog_version?: string | null
